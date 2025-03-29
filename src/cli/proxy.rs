@@ -20,9 +20,9 @@ use tonic::transport::Endpoint;
 #[cfg(doc)]
 use crate::filters::FilterFactory;
 
-use crate::ShutdownRx;
+use crate::signal::ShutdownRx;
 
-pub use crate::components::proxy::Ready;
+pub use crate::{cli::service::XdpOptions, components::proxy::Ready};
 
 define_port!(7777);
 
@@ -55,10 +55,16 @@ pub struct Proxy {
     /// to an management server after receiving no updates.
     #[clap(long, env = "QUILKIN_IDLE_REQUEST_INTERVAL_SECS")]
     pub idle_request_interval_secs: Option<u64>,
-    /// Number of worker threads used to process packets. If not specified defaults
-    /// to number of cpus.
+    /// Number of worker threads used to process packets.
+    ///
+    /// If not specified defaults to number of cpus. Has no effect if XDP is used,
+    /// as the number of workers is always the same as the NIC queue size.
     #[clap(short, long, env = "QUILKIN_WORKERS")]
     pub workers: Option<std::num::NonZeroUsize>,
+    #[clap(flatten)]
+    pub xdp_opts: XdpOptions,
+    #[clap(long = "termination-timeout")]
+    pub termination_timeout: Option<crate::cli::Timeout>,
 }
 
 impl Default for Proxy {
@@ -72,6 +78,8 @@ impl Default for Proxy {
             to_tokens: None,
             idle_request_interval_secs: None,
             workers: None,
+            xdp_opts: Default::default(),
+            termination_timeout: None,
         }
     }
 }
@@ -86,11 +94,7 @@ impl Proxy {
         initialized: Option<tokio::sync::oneshot::Sender<()>>,
         shutdown_rx: ShutdownRx,
     ) -> crate::Result<()> {
-        tracing::info!(
-            port = self.port,
-            proxy_id = &*config.id.load(),
-            "Starting proxy"
-        );
+        tracing::info!(port = self.port, proxy_id = config.id(), "Starting proxy");
 
         // The number of worker tasks to spawn. Each task gets a dedicated queue to
         // consume packets off.
@@ -123,10 +127,12 @@ impl Proxy {
             to: self.to,
             to_tokens,
             num_workers,
-            socket,
+            socket: Some(socket),
             qcmp,
             phoenix,
             notifier: None,
+            xdp: self.xdp_opts,
+            termination_timeout: self.termination_timeout,
         }
         .run(
             crate::components::RunArgs {

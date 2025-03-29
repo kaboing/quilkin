@@ -19,7 +19,8 @@ use std::{
     process::{Command, Stdio},
 };
 
-const VERSION: &str = "0.2.6";
+// The proto-gen version to use, installing if needed
+const VERSION: &str = "0.3.0";
 
 fn check_version(name: &str, prefix: &str, wanted: &str) -> bool {
     if let Ok(output) = Command::new(name).arg("--version").output() {
@@ -31,7 +32,9 @@ fn check_version(name: &str, prefix: &str, wanted: &str) -> bool {
                 if v == wanted {
                     return true;
                 } else {
-                    println!("{name} version detected as '{v}' which did not match expected version '{wanted}'");
+                    println!(
+                        "{name} version detected as '{v}' which did not match expected version '{wanted}'"
+                    );
                 }
             }
         } else {
@@ -74,14 +77,15 @@ fn install() {
         }
 
         // Determine the appropriate cargo/bin directory to place the binary in
-        let mut cargo_root = std::env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let mut cargo_root = std::env::var_os("CARGO_HOME").map_or_else(
+            || {
                 let home = std::env::var_os("HOME").expect("failed to locate CARGO_HOME or HOME");
                 let mut home = PathBuf::from(home);
                 home.push(".cargo");
                 home
-            });
+            },
+            PathBuf::from,
+        );
 
         cargo_root.push("bin");
 
@@ -142,14 +146,15 @@ fn install_protoc() {
         panic!("curl failed to download protoc zip");
     }
 
-    let mut cargo_root = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let mut cargo_root = std::env::var_os("CARGO_HOME").map_or_else(
+        || {
             let home = std::env::var_os("HOME").expect("failed to locate CARGO_HOME or HOME");
             let mut home = PathBuf::from(home);
             home.push(".cargo");
             home
-        });
+        },
+        PathBuf::from,
+    );
 
     if !Command::new("unzip")
         .arg("-q")
@@ -200,7 +205,6 @@ fn execute(which: &str) {
                 "relay/v1alpha1/relay",
                 "config/v1alpha1/config",
                 "filters/capture/v1alpha1/capture",
-                "filters/compress/v1alpha1/compress",
                 "filters/concatenate/v1alpha1/concatenate",
                 "filters/debug/v1alpha1/debug",
                 "filters/drop/v1alpha1/drop",
@@ -220,6 +224,7 @@ fn execute(which: &str) {
     cmd
         // Run rustfmt on the output, since they're committed they might as well be nice
         .arg("--format")
+        .arg("2024")
         .arg("--build-server")
         .arg("--build-client")
         .arg("--generate-transport")

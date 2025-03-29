@@ -15,8 +15,8 @@
  */
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 pub mod k8s;
 
@@ -55,7 +55,7 @@ impl Providers {
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn spawn(
         self,
-        config: std::sync::Arc<crate::Config>,
+        config: Arc<crate::Config>,
         health_check: Arc<AtomicBool>,
         locality: Option<crate::net::endpoint::Locality>,
         address_selector: Option<crate::config::AddressSelector>,
@@ -71,20 +71,35 @@ impl Providers {
                     (None, true) => None,
                     (None, false) => Some("default".into()),
                     (Some(cns), true) => {
-                        tracing::warn!("'{cns}' via --config-namespace, -c, or QUILKIN_AGONES_CONFIG_NAMESPACE is ignored for agents and should not be set");
+                        tracing::warn!(
+                            "'{cns}' via --config-namespace, -c, or QUILKIN_AGONES_CONFIG_NAMESPACE is ignored for agents and should not be set"
+                        );
                         None
                     }
                 };
 
+                use eyre::ContextCompat as _;
+
+                let filters = config
+                    .dyn_cfg
+                    .filters()
+                    .context("agones requires filters")?;
+                let clusters = config
+                    .dyn_cfg
+                    .clusters()
+                    .context("agones requires clusters")?;
+
                 Self::task(health_check.clone(), {
                     let health_check = health_check.clone();
+
                     move || {
                         crate::config::watch::agones(
                             gameservers_namespace.clone(),
                             config_namespace.clone(),
                             health_check.clone(),
                             locality.clone(),
-                            config.clone(),
+                            filters.clone(),
+                            clusters.clone(),
                             address_selector.clone(),
                         )
                     }

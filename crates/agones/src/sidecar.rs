@@ -16,9 +16,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::{game_server, is_gameserver_ready, quilkin_config_map, quilkin_container, Client};
+    use crate::{Client, game_server, is_gameserver_ready, quilkin_config_map, quilkin_container};
     use k8s_openapi::api::core::v1::{ConfigMap, ConfigMapVolumeSource, Volume};
-    use kube::{api::PostParams, runtime::wait::await_condition, Api, ResourceExt};
+    use kube::{Api, ResourceExt, api::PostParams, runtime::wait::await_condition};
     use quilkin::{config::providers::k8s::agones::GameServer, test::TestHelper};
     use std::time::Duration;
     use tokio::time::timeout;
@@ -47,10 +47,7 @@ mod tests {
         let t = TestHelper::default();
         let recv = t.open_socket_and_recv_single_packet().await;
         let address = crate::gameserver_address(&gs);
-        recv.socket
-            .send_to("hello".as_bytes(), address)
-            .await
-            .unwrap();
+        recv.socket.send_to(b"hello", address).await.unwrap();
 
         let response = timeout(Duration::from_secs(30), recv.packet_rx)
             .await
@@ -124,10 +121,7 @@ clusters:
         let t = TestHelper::default();
         let recv = t.open_socket_and_recv_single_packet().await;
         let address = crate::gameserver_address(&gs);
-        recv.socket
-            .send_to("hello".as_bytes(), address)
-            .await
-            .unwrap();
+        recv.socket.send_to(b"hello", address).await.unwrap();
 
         let response = timeout(Duration::from_secs(30), recv.packet_rx)
             .await

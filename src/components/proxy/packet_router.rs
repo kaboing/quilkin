@@ -15,15 +15,15 @@
  */
 
 use super::{
-    sessions::{SessionKey, SessionManager},
     PipelineError, SessionPool,
+    sessions::{SessionKey, SessionManager},
 };
 use crate::{
+    Config,
     filters::{Filter as _, ReadContext},
-    metrics, Config,
+    metrics,
 };
 use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::mpsc;
 
 #[cfg(target_os = "linux")]
 mod io_uring;
@@ -33,7 +33,7 @@ mod reference;
 /// Representation of an immutable set of bytes pulled from the network, this trait
 /// provides an abstraction over however the packet was received (epoll, io-uring, xdp)
 ///
-/// Use [PacketMut] if you need a mutable representation.
+/// Use [`PacketMut`] if you need a mutable representation.
 pub trait Packet: Sized {
     /// Returns the underlying slice of bytes representing the packet.
     fn as_slice(&self) -> &[u8];
@@ -51,9 +51,6 @@ pub trait Packet: Sized {
 /// provides an abstraction over however the packet was received (epoll, io-uring, xdp)
 pub trait PacketMut: Sized + Packet {
     type FrozenPacket: Packet;
-    fn alloc_sized(&self, size: usize) -> Option<Self>;
-    fn as_mut_slice(&mut self) -> &mut [u8];
-    fn set_len(&mut self, len: usize);
     fn remove_head(&mut self, length: usize);
     fn remove_tail(&mut self, length: usize);
     fn extend_head(&mut self, bytes: &[u8]);
@@ -76,7 +73,6 @@ impl<P: PacketMut> DownstreamPacket<P> {
         worker_id: usize,
         config: &Arc<Config>,
         sessions: &S,
-        error_acc: &mut super::error::ErrorAccumulator,
         destinations: &mut Vec<crate::net::EndpointAddress>,
     ) {
         tracing::trace!(
@@ -87,17 +83,11 @@ impl<P: PacketMut> DownstreamPacket<P> {
         );
 
         let timer = metrics::processing_time(metrics::READ).start_timer();
-        match self.process_inner(config, sessions, destinations) {
-            Ok(()) => {
-                error_acc.maybe_send();
-            }
-            Err(error) => {
-                let discriminant = error.discriminant();
-                metrics::errors_total(metrics::READ, discriminant, &metrics::EMPTY).inc();
-                metrics::packets_dropped_total(metrics::READ, discriminant, &metrics::EMPTY).inc();
+        if let Err(error) = self.process_inner(config, sessions, destinations) {
+            let discriminant = error.discriminant();
 
-                error_acc.push_error(error);
-            }
+            error.inc_system_errors_total(metrics::READ, &metrics::EMPTY);
+            metrics::packets_dropped_total(metrics::READ, discriminant, &metrics::EMPTY).inc();
         }
 
         timer.stop_and_record();
@@ -111,13 +101,21 @@ impl<P: PacketMut> DownstreamPacket<P> {
         sessions: &S,
         destinations: &mut Vec<crate::net::EndpointAddress>,
     ) -> Result<(), PipelineError> {
-        if !config.clusters.read().has_endpoints() {
+        let Some(clusters) = config
+            .dyn_cfg
+            .clusters()
+            .filter(|c| c.read().has_endpoints())
+        else {
             tracing::trace!("no upstream endpoints");
             return Err(PipelineError::NoUpstreamEndpoints);
-        }
+        };
 
-        let cm = config.clusters.clone_value();
-        let filters = config.filters.load();
+        let cm = clusters.clone_value();
+        let Some(filters) = config.dyn_cfg.filters() else {
+            return Err(PipelineError::Filter(crate::filters::FilterError::Custom(
+                "no filters loaded",
+            )));
+        };
         let mut context = ReadContext::new(&cm, self.source.into(), self.contents, destinations);
         filters.read(&mut context).map_err(PipelineError::Filter)?;
 
@@ -149,7 +147,6 @@ pub struct DownstreamReceiveWorkerConfig {
     pub port: u16,
     pub config: Arc<Config>,
     pub sessions: Arc<SessionPool>,
-    pub error_sender: super::error::ErrorSender,
     pub buffer_pool: Arc<crate::collections::BufferPool>,
 }
 
@@ -158,15 +155,13 @@ pub struct DownstreamReceiveWorkerConfig {
 /// This function also spawns the set of worker tasks responsible for consuming packets
 /// off the aforementioned queue and processing them through the filter chain and session
 /// pipeline.
-pub async fn spawn_receivers(
+pub fn spawn_receivers(
     config: Arc<Config>,
     socket: socket2::Socket,
-    worker_sends: Vec<(super::PendingSends, super::PacketSendReceiver)>,
+    worker_sends: Vec<crate::net::PacketQueue>,
     sessions: &Arc<SessionPool>,
     buffer_pool: Arc<crate::collections::BufferPool>,
 ) -> crate::Result<()> {
-    let (error_sender, mut error_receiver) = mpsc::channel(128);
-
     let port = crate::net::socket_port(&socket);
 
     for (worker_id, ws) in worker_sends.into_iter().enumerate() {
@@ -175,47 +170,11 @@ pub async fn spawn_receivers(
             port,
             config: config.clone(),
             sessions: sessions.clone(),
-            error_sender: error_sender.clone(),
             buffer_pool: buffer_pool.clone(),
         };
 
-        worker.spawn(ws).await?;
+        worker.spawn(ws)?;
     }
-
-    drop(error_sender);
-
-    tokio::spawn(async move {
-        let mut log_task = tokio::time::interval(std::time::Duration::from_secs(5));
-
-        #[allow(clippy::mutable_key_type)]
-        let mut pipeline_errors = super::error::ErrorMap::default();
-
-        #[allow(clippy::mutable_key_type)]
-        fn report(errors: &mut super::error::ErrorMap) {
-            for (error, instances) in errors.drain() {
-                tracing::warn!(%error, %instances, "pipeline report");
-            }
-        }
-
-        loop {
-            tokio::select! {
-                _ = log_task.tick() => {
-                    report(&mut pipeline_errors);
-                }
-                received = error_receiver.recv() => {
-                    let Some(errors) = received else {
-                        report(&mut pipeline_errors);
-                        tracing::info!("pipeline reporting task closed");
-                        return;
-                    };
-
-                    for (k, v) in errors {
-                        *pipeline_errors.entry(k).or_default() += v;
-                    }
-                }
-            }
-        }
-    });
 
     Ok(())
 }

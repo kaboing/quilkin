@@ -1,6 +1,5 @@
 use qt::*;
-use quilkin::{components::proxy, test::TestConfig};
-use tracing::Instrument as _;
+use quilkin::{components::proxy, net, test::TestConfig};
 
 trace_test!(server, {
     let mut sc = qt::sandbox_config!();
@@ -87,35 +86,23 @@ trace_test!(uring_receiver, {
 
     let (mut packet_rx, endpoint) = sb.server("server");
 
-    let (error_sender, mut error_receiver) = tokio::sync::mpsc::channel::<proxy::ErrorMap>(20);
-
-    tokio::task::spawn(
-        async move {
-            while let Some(errors) = error_receiver.recv().await {
-                for error in errors.keys() {
-                    tracing::error!(%error, "error sent from DownstreamReceiverWorker");
-                }
-            }
-        }
-        .instrument(tracing::debug_span!("error rx")),
-    );
-
     let config = std::sync::Arc::new(quilkin::Config::default_non_agent());
     config
-        .clusters
+        .dyn_cfg
+        .clusters()
+        .unwrap()
         .modify(|clusters| clusters.insert_default([endpoint.into()].into()));
 
     let socket = sb.client();
     let (ws, addr) = sb.socket();
 
-    let pending_sends = proxy::PendingSends::new(1).unwrap();
+    let pending_sends = net::queue(1).unwrap();
 
     // we'll test a single DownstreamReceiveWorkerConfig
     proxy::packet_router::DownstreamReceiveWorkerConfig {
         worker_id: 1,
         port: addr.port(),
         config: config.clone(),
-        error_sender,
         buffer_pool: quilkin::test::BUFFER_POOL.clone(),
         sessions: proxy::SessionPool::new(
             config,
@@ -124,7 +111,6 @@ trace_test!(uring_receiver, {
         ),
     }
     .spawn(pending_sends)
-    .await
     .expect("failed to spawn task");
 
     // Drop the socket, otherwise it can
@@ -149,13 +135,15 @@ trace_test!(
 
         let config = std::sync::Arc::new(quilkin::Config::default_non_agent());
         config
-            .clusters
+            .dyn_cfg
+            .clusters()
+            .unwrap()
             .modify(|clusters| clusters.insert_default([endpoint.into()].into()));
 
         let pending_sends: Vec<_> = [
-            proxy::PendingSends::new(1).unwrap(),
-            proxy::PendingSends::new(1).unwrap(),
-            proxy::PendingSends::new(1).unwrap(),
+            net::queue(1).unwrap(),
+            net::queue(1).unwrap(),
+            net::queue(1).unwrap(),
         ]
         .into_iter()
         .collect();
@@ -176,7 +164,6 @@ trace_test!(
             &sessions,
             BUFFER_POOL.clone(),
         )
-        .await
         .unwrap();
 
         let socket = std::sync::Arc::new(sb.client());

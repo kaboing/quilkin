@@ -19,7 +19,6 @@ use std::sync::Arc;
 use crate::{
     components::relay,
     config::{Config, Providers},
-    net::TcpListener,
 };
 pub use relay::Ready;
 
@@ -34,7 +33,7 @@ pub struct Relay {
     /// Port for mDS service.
     #[clap(short, long, env = "QUILKIN_MDS_PORT", default_value_t = PORT)]
     pub mds_port: u16,
-    /// Port for xDS management_server service
+    /// Port for xDS management server service
     #[clap(short, long, env = super::PORT_ENV_VAR, default_value_t = super::manage::PORT)]
     pub xds_port: u16,
     /// The interval in seconds at which the relay will send a discovery request
@@ -59,16 +58,15 @@ impl Default for Relay {
 impl Relay {
     pub async fn run(
         self,
+        locality: Option<crate::net::endpoint::Locality>,
         config: Arc<Config>,
         ready: Ready,
-        shutdown_rx: crate::ShutdownRx,
+        shutdown_rx: crate::signal::ShutdownRx,
     ) -> crate::Result<()> {
-        let xds_listener = TcpListener::bind(Some(self.xds_port))?;
-        let mds_listener = TcpListener::bind(Some(self.mds_port))?;
-
         relay::Relay {
-            xds_listener,
-            mds_listener,
+            xds_port: self.xds_port,
+            mds_port: self.mds_port,
+            locality,
             provider: self.providers,
         }
         .run(crate::components::RunArgs {

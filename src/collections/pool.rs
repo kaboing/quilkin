@@ -19,8 +19,8 @@ use parking_lot::Mutex;
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
         Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
     },
 };
 
@@ -251,8 +251,7 @@ impl std::ops::Deref for PoolBuffer {
 impl std::ops::DerefMut for PoolBuffer {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        dbg!(self.len());
-        self.as_mut_slice(0..dbg!(self.inner.capacity()))
+        self.as_mut_slice(0..self.inner.capacity())
     }
 }
 
@@ -270,7 +269,7 @@ impl Drop for PoolBuffer {
             inner.unsplit(suffix);
         }
 
-        self.owner.absorb(inner, self.index)
+        self.owner.absorb(inner, self.index);
     }
 }
 
@@ -288,16 +287,6 @@ impl Packet for PoolBuffer {
 
 impl PacketMut for PoolBuffer {
     type FrozenPacket = FrozenPoolBuffer;
-
-    #[inline]
-    fn alloc_sized(&self, size: usize) -> Option<Self> {
-        Some(self.owner.clone().alloc_sized(size))
-    }
-
-    #[inline]
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.as_mut_slice(0..dbg!(self.capacity()))
-    }
 
     #[inline]
     fn remove_head(&mut self, length: usize) {
@@ -322,11 +311,6 @@ impl PacketMut for PoolBuffer {
     #[inline]
     fn freeze(self) -> FrozenPoolBuffer {
         self.freeze()
-    }
-
-    #[inline]
-    fn set_len(&mut self, len: usize) {
-        self.truncate(len);
     }
 }
 

@@ -1,7 +1,7 @@
 #![cfg(target_pointer_width = "64")]
 
 use divan::Bencher;
-use prost_types::{value::Kind, Value};
+use prost_types::{Value, value::Kind};
 use rand::SeedableRng;
 
 use quilkin::{net::cluster::proto::Endpoint as ProtoEndpoint, xds::Resource};
@@ -79,21 +79,21 @@ impl GenAddress for Ip {
     fn generate(&mut self, slim: bool) -> (usize, ProtoEndpoint) {
         let ip = if self.counter % 2 == 0 {
             std::net::Ipv6Addr::new(
-                (self.counter >> 112 & 0xffff) as _,
-                (self.counter >> 96 & 0xffff) as _,
-                (self.counter >> 80 & 0xffff) as _,
-                (self.counter >> 64 & 0xffff) as _,
-                (self.counter >> 48 & 0xffff) as _,
-                (self.counter >> 32 & 0xffff) as _,
-                (self.counter >> 16 & 0xffff) as _,
+                ((self.counter >> 112) & 0xffff) as _,
+                ((self.counter >> 96) & 0xffff) as _,
+                ((self.counter >> 80) & 0xffff) as _,
+                ((self.counter >> 64) & 0xffff) as _,
+                ((self.counter >> 48) & 0xffff) as _,
+                ((self.counter >> 32) & 0xffff) as _,
+                ((self.counter >> 16) & 0xffff) as _,
                 (self.counter & 0xffff) as _,
             )
             .into()
         } else {
             std::net::Ipv4Addr::new(
-                (self.counter >> 24 & 0xff) as _,
-                (self.counter >> 16 & 0xff) as _,
-                (self.counter >> 8 & 0xff) as _,
+                ((self.counter >> 24) & 0xff) as _,
+                ((self.counter >> 16) & 0xff) as _,
+                ((self.counter >> 8) & 0xff) as _,
                 (self.counter & 0xff) as _,
             )
             .into()
@@ -124,7 +124,7 @@ mod endpoint {
     #[divan::bench(
         types = [Name, Ip],
     )]
-    fn slower<G: GenAddress>(bencher: Bencher) {
+    fn slower<G: GenAddress>(bencher: Bencher<'_, '_>) {
         let mut genn = G::default();
         bencher
             .with_inputs(|| genn.generate(false))
@@ -135,7 +135,7 @@ mod endpoint {
     #[divan::bench(
         types = [Name, Ip],
     )]
-    fn faster<G: GenAddress>(bencher: Bencher) {
+    fn faster<G: GenAddress>(bencher: Bencher<'_, '_>) {
         let mut genn = G::default();
         bencher
             .with_inputs(|| genn.generate(true))
@@ -156,34 +156,20 @@ struct Listener {
 impl GenResource for Listener {
     fn generate(&mut self, _slim: bool) -> prost_types::Any {
         use quilkin::filters::{self, StaticFilter};
-        let filters = [
-            quilkin::config::Filter {
-                name: filters::capture::Capture::NAME.into(),
-                label: None,
-                config: Some(
-                    serde_json::to_value(&filters::capture::Config {
-                        metadata_key: "boop".into(),
-                        strategy: filters::capture::Strategy::Suffix(filters::capture::Suffix {
-                            size: 3,
-                            remove: true,
-                        }),
-                    })
-                    .unwrap(),
-                ),
-            },
-            quilkin::config::Filter {
-                name: filters::compress::Compress::NAME.into(),
-                label: Some("a label".into()),
-                config: Some(
-                    serde_json::to_value(filters::compress::Config {
-                        mode: filters::compress::Mode::Lz4,
-                        on_read: filters::compress::Action::Decompress,
-                        on_write: filters::compress::Action::Compress,
-                    })
-                    .unwrap(),
-                ),
-            },
-        ];
+        let filters = [quilkin::config::Filter {
+            name: filters::capture::Capture::NAME.into(),
+            label: None,
+            config: Some(
+                serde_json::to_value(&filters::capture::Config {
+                    metadata_key: "boop".into(),
+                    strategy: filters::capture::Strategy::Suffix(filters::capture::Suffix {
+                        size: 3,
+                        remove: true,
+                    }),
+                })
+                .unwrap(),
+            ),
+        }];
 
         Resource::FilterChain(quilkin::net::cluster::proto::FilterChain {
             filters: filters
@@ -234,7 +220,7 @@ impl GenResource for Cluster {
 fn deserialize(a: prost_types::Any) {
     match Resource::try_decode(a).unwrap() {
         Resource::Listener(_) => {
-            todo!()
+            unreachable!()
         }
         Resource::FilterChain(fc) => {
             let chain: quilkin::filters::FilterChain = if fc.filters.is_empty() {
@@ -268,7 +254,7 @@ fn deserialize(a: prost_types::Any) {
 fn deserialize_faster(a: prost_types::Any) {
     match Resource::try_decode(a).unwrap() {
         Resource::Listener(_) => {
-            unimplemented!()
+            unreachable!()
         }
         Resource::FilterChain(fc) => {
             quilkin::filters::FilterChain::try_create_fallible(fc.filters).unwrap();
@@ -300,7 +286,7 @@ mod resource {
     #[divan::bench(
         types = [Listener, Cluster],
     )]
-    fn slower<G: GenResource>(bencher: Bencher) {
+    fn slower<G: GenResource>(bencher: Bencher<'_, '_>) {
         let mut genn = G::default();
         bencher
             .with_inputs(|| genn.generate(false))
@@ -311,7 +297,7 @@ mod resource {
     #[divan::bench(
         types = [Listener, Cluster],
     )]
-    fn faster<G: GenResource>(bencher: Bencher) {
+    fn faster<G: GenResource>(bencher: Bencher<'_, '_>) {
         let mut genn = G::default();
         bencher
             .with_inputs(|| genn.generate(true))

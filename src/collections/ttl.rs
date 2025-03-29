@@ -14,16 +14,16 @@
  * limitations under the License.
  */
 
+use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::mapref::one::{Ref, RefMut};
-use dashmap::DashMap;
 use tracing::warn;
 
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::oneshot::{channel, Receiver, Sender};
+use tokio::sync::oneshot::{Receiver, Sender, channel};
 
 pub use dashmap::try_result::TryResult;
 
@@ -53,7 +53,7 @@ impl<V> Value<V> {
     }
 
     /// Get the expiration time for this value. The returned value is the
-    /// number of seconds relative to some reference point (e.g UNIX_EPOCH), based
+    /// number of seconds relative to some reference point (e.g `UNIX_EPOCH`), based
     /// on the clock being used.
     #[inline]
     fn expiration_secs(&self) -> u64 {
@@ -120,10 +120,13 @@ impl<K, V> Drop for Map<K, V> {
     }
 }
 
-/// TtlMap is a key value hash map where entries are associated with a TTL.
+/// A key value hash map where entries are associated with a TTL.
+///
 /// When the TTL for an entry elapses, the entry is removed from the map.
+///
 /// The TTL is reset each time the entry is (re)inserted or read via [`TtlMap::get`],
 /// [`TtlMap::get_mut`] functions, or via the [`TtlMap::entry`] interface.
+///
 /// During tests, the internal clock implementation is driven by [`tokio::time`] so
 /// functions like [`tokio::time::pause`] and [`tokio::time::advance`] can be used.
 pub struct TtlMap<K, V>(Arc<Map<K, V>>);
@@ -160,7 +163,7 @@ where
     }
 
     /// Returns the current time as the number of seconds relative to some initial
-    /// reference point (e.g UNIX_EPOCH), based on the clock implementation being used.
+    /// reference point (e.g `UNIX_EPOCH`), based on the clock implementation being used.
     /// In tests, this will be driven by [`tokio::time`]
     #[inline]
     pub(crate) fn now_relative_secs(&self) -> u64 {
@@ -175,20 +178,22 @@ where
     V: Send + Sync,
 {
     /// Returns a reference to value corresponding to key.
-    pub fn get(&self, key: &K) -> Option<Ref<K, Value<V>>> {
+    #[inline]
+    pub fn get(&self, key: &K) -> Option<Ref<'_, K, Value<V>>> {
         let value = self.0.inner.get(key);
-        if let Some(ref value) = value {
-            value.update_expiration(self.0.ttl)
+        if let Some(value) = &value {
+            value.update_expiration(self.0.ttl);
         }
 
         value
     }
 
     /// Returns a reference to value corresponding to key.
-    pub fn try_get(&self, key: &K) -> TryResult<Ref<K, Value<V>>> {
+    #[inline]
+    pub fn try_get(&self, key: &K) -> TryResult<Ref<'_, K, Value<V>>> {
         let value = self.0.inner.try_get(key);
-        if let TryResult::Present(ref value) = value {
-            value.update_expiration(self.0.ttl)
+        if let TryResult::Present(value) = &value {
+            value.update_expiration(self.0.ttl);
         }
 
         value
@@ -196,7 +201,8 @@ where
 
     /// Returns a mutable reference to value corresponding to key.
     /// The value will be reset to expire at the configured TTL after the time of retrieval.
-    pub fn get_mut(&self, key: &K) -> Option<RefMut<K, Value<V>>> {
+    #[inline]
+    pub fn get_mut(&self, key: &K) -> Option<RefMut<'_, K, Value<V>>> {
         let value = self.0.inner.get_mut(key);
         if let Some(ref value) = value {
             value.update_expiration(self.0.ttl);
@@ -206,21 +212,25 @@ where
     }
 
     /// Returns the number of entries currently in the map.
+    #[inline]
     pub fn len(&self) -> usize {
         self.0.inner.len()
     }
 
     /// Returns whether the map currently contains no entries.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Returns whether the map currently contains any entries.
+    #[inline]
     pub fn is_not_empty(&self) -> bool {
         !self.is_empty()
     }
 
     /// Returns true if the map contains a value for the specified key.
+    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.0.inner.contains_key(key)
     }
@@ -228,6 +238,7 @@ where
     /// Inserts a key-value pair into the map.
     /// The value will be set to expire at the configured TTL after the time of insertion.
     /// If a previous value existed for this key, that value is returned.
+    #[inline]
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         self.0
             .inner
@@ -236,6 +247,7 @@ where
     }
 
     /// Removes a key-value pair from the map.
+    #[inline]
     pub fn remove(&self, key: K) -> bool {
         self.0.inner.remove(&key).is_some()
     }
@@ -249,7 +261,8 @@ where
     /// Returns an entry for in-place updates of the specified key-value pair.
     /// Note: This acquires a write lock on the map's shard that corresponds
     /// to the entry.
-    pub fn entry(&self, key: K) -> Entry<K, Value<V>> {
+    #[inline]
+    pub fn entry(&self, key: K) -> Entry<'_, K, Value<V>> {
         let ttl = self.0.ttl;
         match self.0.inner.entry(key) {
             inner @ DashMapEntry::Occupied(_) => Entry::Occupied(OccupiedEntry {
@@ -326,7 +339,7 @@ where
                 value.update_expiration(self.ttl);
                 value
             }
-            _ => unreachable!("BUG: entry type should be occupied"),
+            DashMapEntry::Vacant(_) => unreachable!("BUG: entry type should be occupied"),
         }
     }
 
@@ -340,7 +353,7 @@ where
                 value.update_expiration(self.ttl);
                 value
             }
-            _ => unreachable!("BUG: entry type should be occupied"),
+            DashMapEntry::Vacant(_) => unreachable!("BUG: entry type should be occupied"),
         }
     }
 
@@ -352,7 +365,7 @@ where
             DashMapEntry::Occupied(entry) => {
                 entry.insert(Value::new(value, self.ttl, self.clock.clone()))
             }
-            _ => unreachable!("BUG: entry type should be occupied"),
+            DashMapEntry::Vacant(_) => unreachable!("BUG: entry type should be occupied"),
         }
     }
 }
@@ -368,7 +381,7 @@ where
             DashMapEntry::Vacant(entry) => {
                 entry.insert(Value::new(value, self.ttl, self.clock.clone()))
             }
-            _ => unreachable!("BUG: entry type should be vacant"),
+            DashMapEntry::Occupied(_) => unreachable!("BUG: entry type should be vacant"),
         }
     }
 }
@@ -448,13 +461,14 @@ impl Clock {
     }
 
     /// Returns the current time in seconds, relative to some base time instant.
-    /// For non test cases, relative to UNIX_EPOCH, while during test, a random
+    /// For non test cases, relative to `UNIX_EPOCH`, while during test, a random
     /// point in the past is used.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn now_relative_secs(&self) -> Result<u64, String> {
         #[cfg(not(test))]
         return SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| {
+            .map_err(|_err| {
                 String::from("duration_since was called with time later than the current time")
             })
             .map(|t| t.as_secs());
@@ -464,11 +478,12 @@ impl Clock {
     }
 
     /// Returns the expiration time from now in seconds for the given ttl.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn compute_expiration_secs(&self, ttl: Duration) -> Result<u64, String> {
         #[cfg(not(test))]
         return (SystemTime::now() + ttl)
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| {
+            .map_err(|_err| {
                 String::from("duration_since was called with time later than the current time")
             })
             .map(|t| t.as_secs());
@@ -584,7 +599,7 @@ mod tests {
                 assert_eq!(entry.get().value, 1);
                 entry.insert(5);
             }
-            _ => unreachable!("expected occupied entry"),
+            Entry::Vacant(_) => unreachable!("expected occupied entry"),
         }
 
         assert_eq!(map.get(&one).unwrap().value, 5);
@@ -604,7 +619,7 @@ mod tests {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().value = 5;
             }
-            _ => unreachable!("expected occupied entry"),
+            Entry::Vacant(_) => unreachable!("expected occupied entry"),
         }
 
         assert_eq!(map.get(&one).unwrap().value, 5);
@@ -625,7 +640,7 @@ mod tests {
                 assert_eq!(e.value, 1);
                 e.value = 5;
             }
-            _ => unreachable!("expected occupied entry"),
+            Entry::Occupied(_) => unreachable!("expected occupied entry"),
         }
 
         assert_eq!(map.get(&one).unwrap().value, 5);
@@ -650,7 +665,7 @@ mod tests {
 
         let exp2 = match map.entry(one.clone()) {
             Entry::Occupied(entry) => entry.get().expiration_secs(),
-            _ => unreachable!("expected occupied entry"),
+            Entry::Vacant(_) => unreachable!("expected occupied entry"),
         };
 
         assert!(exp1 < exp2);
@@ -676,7 +691,7 @@ mod tests {
 
         let exp2 = match map.entry(one) {
             Entry::Occupied(mut entry) => entry.get_mut().expiration_secs(),
-            _ => unreachable!("expected occupied entry"),
+            Entry::Vacant(_) => unreachable!("expected occupied entry"),
         };
 
         assert!(exp1 < exp2);
@@ -702,7 +717,7 @@ mod tests {
 
         let old_exp1 = match map.entry(one.clone()) {
             Entry::Occupied(mut entry) => entry.insert(9).expiration_secs(),
-            _ => unreachable!("expected occupied entry"),
+            Entry::Vacant(_) => unreachable!("expected occupied entry"),
         };
 
         let exp2 = map.get(&one).unwrap().expiration_secs();
@@ -726,7 +741,7 @@ mod tests {
 
         let exp1 = match map.entry(one.clone()) {
             Entry::Vacant(entry) => entry.insert(9).expiration_secs(),
-            _ => unreachable!("expected vacant entry"),
+            Entry::Occupied(_) => unreachable!("expected vacant entry"),
         };
 
         time::advance(Duration::from_secs(2)).await;
@@ -752,7 +767,7 @@ mod tests {
 
         let exp = match map.entry(one) {
             Entry::Vacant(entry) => entry.insert(9).expiration_secs(),
-            _ => unreachable!("expected vacant entry"),
+            Entry::Occupied(_) => unreachable!("expected vacant entry"),
         };
 
         // Check that it expires at our configured TTL.
@@ -777,7 +792,7 @@ mod tests {
         time::advance(Duration::from_secs(4)).await;
 
         // Read one key so that it does not expire at the original ttl.
-        let _ = map.get(&two).unwrap();
+        map.get(&two).unwrap();
 
         // Check that only the un-read key is deleted.
         time::advance(Duration::from_secs(4)).await;

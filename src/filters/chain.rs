@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-use prometheus::{exponential_buckets, Histogram};
+use prometheus::{Histogram, exponential_buckets};
 
 use crate::{
     config::Filter as FilterConfig,
-    filters::{prelude::*, FilterRegistry},
-    metrics::{histogram_opts, CollectorExt},
+    filters::{FilterRegistry, prelude::*},
+    metrics::{CollectorExt, histogram_opts},
 };
 
 const FILTER_LABEL: &str = "filter";
@@ -31,7 +31,7 @@ const BUCKET_START: f64 = 0.000125;
 
 const BUCKET_FACTOR: f64 = 2.5;
 
-/// At an exponential factor of 2.5 (BUCKET_FACTOR), 11 iterations gets us to just over half a
+/// At an exponential factor of 2.5 ([`BUCKET_FACTOR`]), 11 iterations gets us to just over half a
 /// second. Any processing that occurs over half a second is far too long, so we end
 /// the bucketing there as we don't care about granularity past this value.
 const BUCKET_COUNT: usize = 11;
@@ -91,6 +91,11 @@ impl FilterChain {
         })
     }
 
+    pub fn testing<const N: usize>(filters: [FilterInstance; N]) -> Self {
+        let filters = filters.into_iter().map(|f| (String::new(), f)).collect();
+        Self::new(filters).unwrap()
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.filters.len()
@@ -115,7 +120,7 @@ impl FilterChain {
     }
 
     /// Validates the filter configurations in the provided config and constructs
-    /// a FilterChain if all configurations are valid, including the conversion
+    /// a [`Self`] if all configurations are valid, including the conversion
     /// into a [`Filter`]
     pub fn try_create_fallible<Item>(
         filter_configs: impl IntoIterator<Item = Item>,
@@ -139,7 +144,7 @@ impl FilterChain {
     }
 
     /// Validates the filter configurations in the provided config and constructs
-    /// a FilterChain if all configurations are valid.
+    /// a [`Self`] if all configurations are valid.
     pub fn try_create(
         filter_configs: impl IntoIterator<Item = FilterConfig>,
     ) -> Result<Self, CreationError> {
@@ -263,8 +268,8 @@ impl schemars::JsonSchema for FilterChain {
     fn schema_name() -> String {
         <Vec<FilterConfig>>::schema_name()
     }
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        <Vec<FilterConfig>>::json_schema(gen)
+    fn json_schema(r#gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        <Vec<FilterConfig>>::json_schema(r#gen)
     }
 
     fn is_referenceable() -> bool {
@@ -333,7 +338,7 @@ mod tests {
         config,
         filters::Debug,
         net::endpoint::Endpoint,
-        test::{alloc_buffer, TestConfig, TestFilter},
+        test::{TestConfig, TestFilter, alloc_buffer},
     };
 
     use super::*;
@@ -491,6 +496,6 @@ mod tests {
                 config: None,
             },],
             configs
-        )
+        );
     }
 }

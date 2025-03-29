@@ -17,13 +17,16 @@
 [package]
 name = "qt"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
+# Packet creation/parsing to validate the packet processing for XDP
+etherparse = "0.17"
+insta = { version = "1.42", features = ["json"] }
 once_cell.workspace = true
 quilkin.workspace = true
 rand.workspace = true
@@ -33,3 +36,4 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+xdp = { workspace = true, features = ["__debug"] }

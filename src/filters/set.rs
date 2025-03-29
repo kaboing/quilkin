@@ -34,7 +34,6 @@ pub type FilterMap = std::collections::HashMap<&'static str, Arc<DynFilterFactor
 /// - [`capture`][filters::capture]
 /// - [`token_router`][filters::token_router]
 /// - [`hashed_token_router`][filters::token_router]
-/// - [`compress`][filters::compress]
 #[derive(Clone)]
 pub struct FilterSet(FilterMap);
 
@@ -46,7 +45,6 @@ impl FilterSet {
         Self::with(
             [
                 filters::Capture::factory(),
-                filters::Compress::factory(),
                 filters::Concatenate::factory(),
                 filters::Debug::factory(),
                 filters::Drop::factory(),
@@ -83,7 +81,7 @@ impl FilterSet {
     }
 
     /// Returns a by reference iterator over the set of filters.
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> Iter<'_> {
         Iter {
             inner: self.0.iter(),
         }

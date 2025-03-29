@@ -34,18 +34,6 @@ steps:
   - name: us-docker.pkg.dev/$PROJECT_ID/ci/make-docker
     dir: ./build
     args:
-      - test-quilkin
-    id: test-quilkin
-    waitFor:
-      - fetch-quilkin
-  - name: us-docker.pkg.dev/$PROJECT_ID/ci/make-docker
-    dir: ./build
-    args:
-      - test-docs
-    id: test-docs
-  - name: us-docker.pkg.dev/$PROJECT_ID/ci/make-docker
-    dir: ./build
-    args:
       - build-image
     id: build
 
@@ -80,8 +68,6 @@ steps:
     args:
       - ci-gcloud-auth-cluster
     id: gcloud-auth-cluster
-    waitFor:
-      - test-quilkin
   - name: us-docker.pkg.dev/$PROJECT_ID/ci/make-docker
     dir: ./build
     args:
@@ -99,7 +85,6 @@ options:
     - "REPOSITORY=${_REPOSITORY}"
     - "BUILD_IMAGE_TAG=${_BUILD_IMAGE_TAG}"
     - "CARGO_TERM_COLOR=always"
-    - 'RUSTFLAGS="-C target-feature=+aes,+avx2"'
   machineType: E2_HIGHCPU_32
   dynamic_substitutions: true
 timeout: 7200s

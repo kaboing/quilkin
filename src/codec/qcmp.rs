@@ -17,9 +17,10 @@
 //! Logic for parsing and generating Quilkin Control Message Protocol (QCMP) messages.
 
 use crate::{
+    metrics,
     net::{
-        phoenix::{DistanceMeasure, Measurement},
         DualStackEpollSocket,
+        phoenix::{DistanceMeasure, Measurement},
     },
     time::{DurationNanos, UtcTimestamp},
 };
@@ -192,8 +193,11 @@ impl Measurement for QcmpMeasurement {
     }
 }
 
-pub fn spawn(socket: socket2::Socket, mut shutdown_rx: crate::ShutdownRx) -> crate::Result<()> {
-    use tracing::{instrument::WithSubscriber as _, Instrument as _};
+pub fn spawn(
+    socket: socket2::Socket,
+    mut shutdown_rx: crate::signal::ShutdownRx,
+) -> crate::Result<()> {
+    use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
     let port = crate::net::socket_port(&socket);
 
@@ -202,23 +206,31 @@ pub fn spawn(socket: socket2::Socket, mut shutdown_rx: crate::ShutdownRx) -> cra
             let mut input_buf = [0u8; MAX_QCMP_PACKET_LEN];
             let socket = DualStackEpollSocket::new(port).unwrap();
             let mut output_buf = QcmpPacket::default();
+            metrics::qcmp::active(true);
 
             loop {
                 let result = tokio::select! {
                     result = socket.recv_from(&mut input_buf) => result,
-                    _ = shutdown_rx.changed() => return,
+                    _ = shutdown_rx.changed() => {
+                        metrics::qcmp::active(false);
+                        return
+                    }
                 };
-                match result {
+
+                match track_error(result, &crate::metrics::AsnInfo::EMPTY) {
                     Ok((size, source)) => {
                         let received_at = UtcTimestamp::now();
-                        let command = match Protocol::parse(&input_buf[..size]) {
+                        let ip_entry = crate::net::maxmind_db::MaxmindDb::lookup(source.ip()).map(crate::net::maxmind_db::MetricsIpNetEntry::from);
+                        let asn_info = crate::metrics::AsnInfo::from(ip_entry.as_ref());
+                        let command = match track_error(Protocol::parse(&input_buf[..size]), &asn_info) {
                             Ok(Some(command)) => command,
                             Ok(None) => {
                                 tracing::debug!("rejected non-qcmp packet");
+                                metrics::qcmp::packets_total_invalid(size, &asn_info);
                                 continue;
                             }
                             Err(error) => {
-                                tracing::debug!(%error, "rejected malformed packet");
+                                tracing::debug!(%error, %source, "rejected malformed packet");
                                 continue;
                             }
                         };
@@ -228,25 +240,29 @@ pub fn spawn(socket: socket2::Socket, mut shutdown_rx: crate::ShutdownRx) -> cra
                             nonce,
                         } = command
                         else {
-                            tracing::warn!("rejected unsupported QCMP packet");
+                            tracing::warn!(%source, "rejected unsupported QCMP packet");
+                            metrics::qcmp::packets_total_unsupported(size, &asn_info);
                             continue;
                         };
 
+                        metrics::qcmp::packets_total_valid(size, &asn_info);
+                        metrics::qcmp::ingress_latency(client_timestamp, received_at, &asn_info);
                         Protocol::ping_reply(nonce, client_timestamp, received_at)
                             .encode(&mut output_buf);
 
                         tracing::debug!(
+                            %source,
                             "sending QCMP pong",
                         );
 
-                        match socket.send_to(&output_buf, source).await {
+                        match track_error(socket.send_to(&output_buf, source).await, &asn_info) {
                             Ok(len) => {
                                 if len != output_buf.len() {
-                                    tracing::error!("failed to send entire QCMP pong response, expected {} but only sent {len}", output_buf.len());
+                                    tracing::error!(%source, "failed to send entire QCMP pong response, expected {} but only sent {len}", output_buf.len());
                                 }
                             }
                             Err(error) => {
-                                tracing::warn!(%error, "error responding to ping");
+                                tracing::warn!(%error, %source, "error responding to ping");
                             }
                         }
                     }
@@ -261,6 +277,16 @@ pub fn spawn(socket: socket2::Socket, mut shutdown_rx: crate::ShutdownRx) -> cra
     );
 
     Ok(())
+}
+
+fn track_error<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    asn_info: &crate::metrics::AsnInfo<'_>,
+) -> Result<T, E> {
+    result.inspect_err(|error| {
+        let reason = error.to_string();
+        metrics::qcmp::errors_total(&reason, asn_info).inc();
+    })
 }
 
 /// The set of possible QCMP commands.
@@ -349,8 +375,7 @@ impl Protocol {
     /// Returns the packet's nonce.
     pub fn nonce(&self) -> u8 {
         match self {
-            Protocol::Ping { nonce, .. } => *nonce,
-            Protocol::PingReply { nonce, .. } => *nonce,
+            Protocol::Ping { nonce, .. } | Protocol::PingReply { nonce, .. } => *nonce,
         }
     }
 
@@ -675,7 +700,7 @@ mod tests {
         let socket = raw_socket_with_reuse(0).unwrap();
         let addr = socket.local_addr().unwrap().as_socket().unwrap();
 
-        let (_tx, rx) = crate::make_shutdown_channel(Default::default());
+        let (_tx, rx) = crate::signal::channel(Default::default());
         spawn(socket, rx).unwrap();
 
         let delay = Duration::from_millis(50);

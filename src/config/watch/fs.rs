@@ -15,8 +15,8 @@
  */
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use notify::Watcher;
@@ -31,8 +31,7 @@ pub async fn watch(
     locality: Option<crate::net::endpoint::Locality>,
 ) -> crate::Result<()> {
     let path = path.into();
-    let span =
-        tracing::info_span!("config_provider", path = %path.display(), id = %config.id.load());
+    let span = tracing::info_span!("config_provider", path = %path.display(), id = %config.id());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     async fn watch_inner(
@@ -106,7 +105,7 @@ mod tests {
         let _handle = tokio::spawn(watch(dest.clone(), <_>::default(), file_path.clone(), None));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        source.clusters.modify(|clusters| {
+        source.dyn_cfg.clusters().unwrap().modify(|clusters| {
             clusters.insert_default(
                 [crate::net::endpoint::Endpoint::with_metadata(
                     (std::net::Ipv4Addr::LOCALHOST, 4321).into(),

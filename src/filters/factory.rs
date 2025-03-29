@@ -48,6 +48,14 @@ impl FilterInstance {
         }))
     }
 
+    pub fn testing(filter: impl Into<FilterKind>) -> Self {
+        Self(Arc::new(FilterInstanceData {
+            config: serde_json::Value::Null,
+            label: None,
+            filter: filter.into(),
+        }))
+    }
+
     pub fn config(&self) -> &serde_json::Value {
         &self.0.config
     }
@@ -96,7 +104,7 @@ pub trait FilterFactory: Sync + Send {
     ) -> Result<serde_json::Value, CreationError>;
 
     /// Returns the [`ConfigType`] from the provided Option, otherwise it returns
-    /// Error::MissingConfig if the Option is None.
+    /// [`Error::MissingConfig`] if the Option is None.
     fn require_config(&self, config: Option<ConfigType>) -> Result<ConfigType, CreationError> {
         config.ok_or_else(|| CreationError::MissingConfig(self.name()))
     }

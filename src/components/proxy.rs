@@ -14,108 +14,20 @@
  *  limitations under the License.
  */
 
-mod error;
+pub(crate) mod error;
 pub mod packet_router;
-mod sessions;
-
-cfg_if::cfg_if! {
-    if #[cfg(target_os = "linux")] {
-        pub(crate) mod io_uring_shared;
-        pub(crate) type PacketSendReceiver = io_uring_shared::EventFd;
-        pub(crate) type PacketSendSender = io_uring_shared::EventFdWriter;
-    } else {
-        pub(crate) type PacketSendReceiver = tokio::sync::watch::Receiver<bool>;
-        pub(crate) type PacketSendSender = tokio::sync::watch::Sender<bool>;
-    }
-}
-
-/// A simple packet queue that signals when a packet is pushed
-///
-/// For io_uring this notifies an eventfd that will be processed on the next
-/// completion loop
-#[derive(Clone)]
-pub struct PendingSends {
-    packets: Arc<parking_lot::Mutex<Vec<SendPacket>>>,
-    notify: PacketSendSender,
-}
-
-impl PendingSends {
-    pub fn new(capacity: usize) -> std::io::Result<(Self, PacketSendReceiver)> {
-        #[cfg(target_os = "linux")]
-        let (notify, rx) = {
-            let rx = io_uring_shared::EventFd::new()?;
-            (rx.writer(), rx)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (notify, rx) = tokio::sync::watch::channel(true);
-
-        Ok((
-            Self {
-                packets: Arc::new(parking_lot::Mutex::new(Vec::with_capacity(capacity))),
-                notify,
-            },
-            rx,
-        ))
-    }
-
-    #[inline]
-    pub(crate) fn capacity(&self) -> usize {
-        self.packets.lock().capacity()
-    }
-
-    /// Pushes a packet onto the queue to be sent, signalling a sender that
-    /// it's available
-    #[inline]
-    pub(crate) fn push(&self, packet: SendPacket) {
-        self.packets.lock().push(packet);
-        #[cfg(target_os = "linux")]
-        self.notify.write(1);
-        #[cfg(not(target_os = "linux"))]
-        let _ = self.notify.send(true);
-    }
-
-    /// Called to shutdown the consumer side of the sends (ie the io loop that is
-    /// actually dequing and sending packets)
-    #[inline]
-    pub(crate) fn shutdown_receiver(&self) {
-        #[cfg(target_os = "linux")]
-        self.notify.write(0xdeadbeef);
-        #[cfg(not(target_os = "linux"))]
-        let _ = self.notify.send(false);
-    }
-
-    /// Swaps the current queue with an empty one so we only lock for a pointer swap
-    #[inline]
-    pub fn swap(&self, mut swap: Vec<SendPacket>) -> Vec<SendPacket> {
-        swap.clear();
-        std::mem::replace(&mut self.packets.lock(), swap)
-    }
-}
+pub(crate) mod sessions;
 
 use super::RunArgs;
-pub use error::{ErrorMap, PipelineError};
+pub use error::PipelineError;
 pub use sessions::SessionPool;
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
-
-pub struct SendPacket {
-    /// The destination address of the packet
-    pub destination: socket2::SockAddr,
-    /// The packet data being sent
-    pub data: crate::collections::FrozenPoolBuffer,
-    /// The asn info for the sender, used for metrics
-    pub asn_info: Option<crate::net::maxmind_db::MetricsIpNetEntry>,
-}
-
-pub struct RecvPacket {
-    pub source: SocketAddr,
-    pub data: crate::collections::PoolBuffer,
-}
 
 #[derive(Clone, Debug)]
 pub struct Ready {
@@ -156,10 +68,12 @@ pub struct Proxy {
     pub management_servers: Vec<tonic::transport::Endpoint>,
     pub to: Vec<SocketAddr>,
     pub to_tokens: Option<ToTokens>,
-    pub socket: socket2::Socket,
+    pub socket: Option<socket2::Socket>,
     pub qcmp: socket2::Socket,
     pub phoenix: crate::net::TcpListener,
     pub notifier: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub xdp: crate::cli::proxy::XdpOptions,
+    pub termination_timeout: Option<crate::cli::Timeout>,
 }
 
 impl Default for Proxy {
@@ -173,17 +87,19 @@ impl Default for Proxy {
             management_servers: Vec::new(),
             to: Vec::new(),
             to_tokens: None,
-            socket: crate::net::raw_socket_with_reuse(0).unwrap(),
+            socket: Some(crate::net::raw_socket_with_reuse(0).unwrap()),
             qcmp,
             phoenix,
             notifier: None,
+            xdp: Default::default(),
+            termination_timeout: None,
         }
     }
 }
 
 impl Proxy {
     pub async fn run(
-        self,
+        mut self,
         RunArgs {
             config,
             ready,
@@ -191,7 +107,8 @@ impl Proxy {
         }: RunArgs<Ready>,
         initialized: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> crate::Result<()> {
-        let _mmdb_task = self.mmdb.map(|source| {
+        let _mmdb_task = self.mmdb.as_ref().map(|source| {
+            let source = source.clone();
             tokio::spawn(async move {
                 while let Err(error) =
                     tryhard::retry_fn(|| crate::MaxmindDb::update(source.clone()))
@@ -204,82 +121,93 @@ impl Proxy {
             })
         });
 
+        let Some(clusters) = config.dyn_cfg.clusters() else {
+            eyre::bail!("empty clusters were not created")
+        };
+
         if !self.to.is_empty() {
-            let endpoints = if let Some(tt) = self.to_tokens {
-                let (unique, overflow) = 256u64.overflowing_pow(tt.length as _);
-                if overflow {
-                    panic!(
-                        "can't generate {} tokens of length {} maximum is {}",
-                        self.to.len() * tt.count,
-                        tt.length,
-                        u64::MAX,
-                    );
-                }
+            let endpoints = match &self.to_tokens {
+                Some(tt) => {
+                    let (unique, overflow) = 256u64.overflowing_pow(tt.length as _);
+                    if overflow {
+                        panic!(
+                            "can't generate {} tokens of length {} maximum is {}",
+                            self.to.len() * tt.count,
+                            tt.length,
+                            u64::MAX,
+                        );
+                    }
 
-                if unique < (self.to.len() * tt.count) as u64 {
-                    panic!(
-                        "we require {} unique tokens but only {unique} can be generated",
-                        self.to.len() * tt.count,
-                    );
-                }
+                    if unique < (self.to.len() * tt.count) as u64 {
+                        panic!(
+                            "we require {} unique tokens but only {unique} can be generated",
+                            self.to.len() * tt.count,
+                        );
+                    }
 
-                {
-                    use crate::filters::StaticFilter as _;
-                    config.filters.store(Arc::new(
-                        crate::filters::FilterChain::try_create([
-                            crate::filters::Capture::as_filter_config(
-                                crate::filters::capture::Config {
-                                    metadata_key: crate::filters::capture::CAPTURED_BYTES.into(),
-                                    strategy: crate::filters::capture::Strategy::Suffix(
-                                        crate::filters::capture::Suffix {
-                                            size: tt.length as _,
-                                            remove: true,
-                                        },
-                                    ),
-                                },
-                            )
+                    {
+                        use crate::filters::StaticFilter as _;
+                        let Some(filters) = config.dyn_cfg.filters() else {
+                            eyre::bail!("empty filters were not created")
+                        };
+
+                        filters.store(Arc::new(
+                            crate::filters::FilterChain::try_create([
+                                crate::filters::Capture::as_filter_config(
+                                    crate::filters::capture::Config {
+                                        metadata_key: crate::filters::capture::CAPTURED_BYTES
+                                            .into(),
+                                        strategy: crate::filters::capture::Strategy::Suffix(
+                                            crate::filters::capture::Suffix {
+                                                size: tt.length as _,
+                                                remove: true,
+                                            },
+                                        ),
+                                    },
+                                )
+                                .unwrap(),
+                                crate::filters::TokenRouter::as_filter_config(None).unwrap(),
+                            ])
                             .unwrap(),
-                            crate::filters::TokenRouter::as_filter_config(None).unwrap(),
-                        ])
-                        .unwrap(),
-                    ));
+                        ));
+                    }
+
+                    let count = tt.count as u64;
+
+                    self.to
+                        .iter()
+                        .enumerate()
+                        .map(|(ind, sa)| {
+                            let mut tokens = std::collections::BTreeSet::new();
+                            let start = ind as u64 * count;
+                            for i in start..(start + count) {
+                                tokens.insert(i.to_le_bytes()[..tt.length].to_vec());
+                            }
+
+                            crate::net::endpoint::Endpoint::with_metadata(
+                                (*sa).into(),
+                                crate::net::endpoint::Metadata { tokens },
+                            )
+                        })
+                        .collect()
                 }
-
-                let count = tt.count as u64;
-
-                self.to
-                    .iter()
-                    .enumerate()
-                    .map(|(ind, sa)| {
-                        let mut tokens = std::collections::BTreeSet::new();
-                        let start = ind as u64 * count;
-                        for i in start..(start + count) {
-                            tokens.insert(i.to_le_bytes()[..tt.length].to_vec());
-                        }
-
-                        crate::net::endpoint::Endpoint::with_metadata(
-                            (*sa).into(),
-                            crate::net::endpoint::Metadata { tokens },
-                        )
-                    })
-                    .collect()
-            } else {
-                self.to
+                _ => self
+                    .to
                     .iter()
                     .cloned()
                     .map(crate::net::endpoint::Endpoint::from)
-                    .collect()
+                    .collect(),
             };
 
-            config.clusters.modify(|clusters| {
-                clusters.insert(None, endpoints);
+            clusters.modify(|clusters| {
+                clusters.insert(None, None, endpoints);
             });
         }
 
-        if !config.clusters.read().has_endpoints() && self.management_servers.is_empty() {
+        if !clusters.read().has_endpoints() && self.management_servers.is_empty() {
             return Err(eyre::eyre!(
-                 "`quilkin proxy` requires at least one `to` address or `management_server` endpoint."
-             ));
+                "`quilkin proxy` requires at least one `to` address or `management_server` endpoint."
+            ));
         }
 
         #[allow(clippy::type_complexity)]
@@ -309,7 +237,7 @@ impl Proxy {
                 *lock = Some(check.clone());
             }
 
-            let id = config.id.load();
+            let id = config.id();
 
             std::thread::Builder::new()
                 .name("proxy-subscription".into())
@@ -345,7 +273,7 @@ impl Proxy {
                             let _stream = client
                                 .delta_subscribe(config.clone(), xds_is_healthy.clone(), tx, SUBS)
                                 .await
-                                .map_err(|_| eyre::eyre!("failed to acquire delta stream"))?;
+                                .map_err(|_err| eyre::eyre!("failed to acquire delta stream"))?;
 
                             let _ = shutdown_rx.changed().await;
                             Ok::<_, eyre::Error>(())
@@ -355,35 +283,28 @@ impl Proxy {
                 .expect("failed to spawn proxy-subscription thread");
         }
 
-        let num_workers = self.num_workers.get();
-        let buffer_pool = Arc::new(crate::collections::BufferPool::new(num_workers, 2 * 1024));
-
-        let mut worker_sends = Vec::with_capacity(num_workers);
-        let mut session_sends = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let psends = PendingSends::new(15)?;
-            session_sends.push(psends.0.clone());
-            worker_sends.push(psends);
-        }
-
-        let sessions = SessionPool::new(config.clone(), session_sends, buffer_pool.clone());
-
-        packet_router::spawn_receivers(
-            config.clone(),
-            self.socket,
-            worker_sends,
-            &sessions,
-            buffer_pool,
+        // TODO: Remove this once the CLI is fully moved over.
+        let udp_port = crate::net::socket_port(&self.socket.take().unwrap());
+        let qcmp_port = crate::net::socket_port(&std::mem::replace(
+            &mut self.qcmp,
+            crate::net::raw_socket_with_reuse(0).unwrap(),
+        ));
+        let phoenix_port = std::mem::replace(
+            &mut self.phoenix,
+            crate::net::TcpListener::bind(None).unwrap(),
         )
-        .await?;
+        .port();
 
-        crate::codec::qcmp::spawn(self.qcmp, shutdown_rx.clone())?;
-        crate::net::phoenix::spawn(
-            self.phoenix,
-            config.clone(),
-            shutdown_rx.clone(),
-            crate::net::phoenix::Phoenix::new(crate::codec::qcmp::QcmpMeasurement::new()?),
-        )?;
+        let svc_task = crate::cli::Service::default()
+            .udp()
+            .udp_port(udp_port)
+            .xdp(self.xdp)
+            .qcmp()
+            .qcmp_port(qcmp_port)
+            .phoenix()
+            .phoenix_port(phoenix_port)
+            .termination_timeout(self.termination_timeout)
+            .spawn_services(&config, &shutdown_rx)?;
 
         tracing::info!("Quilkin is ready");
         if let Some(initialized) = initialized {
@@ -395,7 +316,9 @@ impl Proxy {
             .await
             .map_err(|error| eyre::eyre!(error))?;
 
-        sessions.shutdown(*shutdown_rx.borrow() == crate::ShutdownKind::Normal);
+        if let Ok(Err(error)) = svc_task.await {
+            tracing::error!(%error, "Quilkin proxy services exited with error");
+        }
 
         Ok(())
     }

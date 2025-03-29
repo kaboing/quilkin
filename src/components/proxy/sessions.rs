@@ -18,26 +18,27 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     net::SocketAddr,
-    sync::{atomic, Arc},
+    sync::{Arc, atomic},
     time::Duration,
 };
 
 use tokio::time::Instant;
 
 use crate::{
+    Loggable,
     collections::{BufferPool, FrozenPoolBuffer, PoolBuffer},
-    components::proxy::SendPacket,
     config::Config,
     filters::Filter,
     metrics,
-    net::maxmind_db::{IpNetEntry, MetricsIpNetEntry},
+    net::{
+        PacketQueueSender,
+        maxmind_db::{IpNetEntry, MetricsIpNetEntry},
+        queue::SendPacket,
+    },
     time::UtcTimestamp,
-    Loggable,
 };
 
 use parking_lot::RwLock;
-
-use super::PendingSends;
 
 pub(crate) mod inner_metrics;
 
@@ -97,12 +98,12 @@ impl fmt::Debug for SessionError {
 /// Traffic from different gameservers is then demuxed using their address to
 /// send back to the original client.
 pub struct SessionPool {
-    ports_to_sockets: RwLock<HashMap<u16, PendingSends>>,
+    ports_to_sockets: RwLock<HashMap<u16, PacketQueueSender>>,
     storage: Arc<RwLock<SocketStorage>>,
     session_map: SessionMap,
     buffer_pool: Arc<BufferPool>,
     config: Arc<Config>,
-    downstream_sends: Vec<PendingSends>,
+    downstream_sends: Vec<PacketQueueSender>,
     downstream_index: atomic::AtomicUsize,
 }
 
@@ -121,7 +122,7 @@ impl SessionPool {
     /// to release their sockets back to the parent.
     pub fn new(
         config: Arc<Config>,
-        downstream_sends: Vec<PendingSends>,
+        downstream_sends: Vec<PacketQueueSender>,
         buffer_pool: Arc<BufferPool>,
     ) -> Arc<Self> {
         const SESSION_TIMEOUT_SECONDS: Duration = Duration::from_secs(60);
@@ -142,7 +143,7 @@ impl SessionPool {
     fn create_new_session_from_new_socket<'pool>(
         self: &'pool Arc<Self>,
         key: SessionKey,
-    ) -> Result<(Option<MetricsIpNetEntry>, PendingSends), super::PipelineError> {
+    ) -> Result<(Option<MetricsIpNetEntry>, PacketQueueSender), super::PipelineError> {
         tracing::trace!(source=%key.source, dest=%key.dest, "creating new socket for session");
         let raw_socket = crate::net::raw_socket_with_reuse(0)?;
         let port = raw_socket
@@ -151,7 +152,7 @@ impl SessionPool {
             .ok_or(SessionError::SocketAddressUnavailable)?
             .port();
 
-        let (pending_sends, srecv) = super::PendingSends::new(15)?;
+        let (pending_sends, srecv) = crate::net::queue(15)?;
         self.clone()
             .spawn_session(raw_socket, port, (pending_sends.clone(), srecv))?;
 
@@ -227,10 +228,10 @@ impl SessionPool {
     /// creates a new session either from a fresh socket, or if there are sockets
     /// allocated that are not reserved by an existing destination, using the
     /// existing socket.
-    pub fn get<'pool>(
+    pub(crate) fn get<'pool>(
         self: &'pool Arc<Self>,
         key @ SessionKey { dest, .. }: SessionKey,
-    ) -> Result<(Option<MetricsIpNetEntry>, PendingSends), super::PipelineError> {
+    ) -> Result<(Option<MetricsIpNetEntry>, PacketQueueSender), super::PipelineError> {
         tracing::trace!(source=%key.source, dest=%key.dest, "SessionPool::get");
         // If we already have a session for the key pairing, return that session.
         if let Some(entry) = self.session_map.get(&key) {
@@ -291,9 +292,9 @@ impl SessionPool {
     fn create_session_from_existing_socket<'session>(
         self: &'session Arc<Self>,
         key: SessionKey,
-        pending_sends: PendingSends,
+        pending_sends: PacketQueueSender,
         socket_port: u16,
-    ) -> Result<(Option<MetricsIpNetEntry>, PendingSends), super::PipelineError> {
+    ) -> Result<(Option<MetricsIpNetEntry>, PacketQueueSender), super::PipelineError> {
         tracing::trace!(source=%key.source, dest=%key.dest, "reusing socket for session");
         let asn_info = {
             let mut storage = self.storage.write();
@@ -337,7 +338,7 @@ impl SessionPool {
         Ok((asn_metrics_info, pending_sends))
     }
 
-    /// process_recv_packet processes a packet that is received by this session.
+    /// Processes a packet that is received by this session.
     fn process_recv_packet(
         config: Arc<crate::Config>,
         source: SocketAddr,
@@ -348,8 +349,14 @@ impl SessionPool {
         tracing::trace!(%source, %dest, length = packet.len(), "received packet from upstream");
 
         let mut context = crate::filters::WriteContext::new(source.into(), dest.into(), packet);
+        let Some(filters) = config.dyn_cfg.filters() else {
+            return Err((
+                asn_info,
+                Error::Filter(crate::filters::FilterError::Custom("no filters loaded")),
+            ));
+        };
 
-        if let Err(err) = config.filters.load().write(&mut context) {
+        if let Err(err) = filters.load().write(&mut context) {
             return Err((asn_info, err.into()));
         }
 
@@ -381,7 +388,7 @@ impl SessionPool {
         self: &Arc<Self>,
         key: SessionKey,
         packet: FrozenPoolBuffer,
-    ) -> Result<PendingSends, super::PipelineError> {
+    ) -> Result<PacketQueueSender, super::PipelineError> {
         let (asn_info, sender) = self.get(key)?;
 
         sender.push(SendPacket {
@@ -447,20 +454,6 @@ impl SessionPool {
         storage.destination_to_sources.remove(&(*dest, port));
         tracing::trace!("socket released");
     }
-
-    /// Closes all active sessions, and all downstream listeners
-    pub(crate) fn shutdown(self: Arc<Self>, wait: bool) {
-        // Disable downstream listeners first so sessions aren't spawned while
-        // we are trying to reap the active sessions
-        for downstream_listener in &self.downstream_sends {
-            downstream_listener.shutdown_receiver();
-        }
-
-        if wait && !self.session_map.is_empty() {
-            tracing::info!(sessions=%self.session_map.len(), "waiting for active sessions to expire");
-            self.session_map.clear();
-        }
-    }
 }
 
 impl SessionManager for Arc<SessionPool> {
@@ -482,24 +475,24 @@ impl Drop for SessionPool {
 
 /// Session encapsulates a UDP stream session
 pub struct Session {
-    /// created_at is time at which the session was created
+    /// The time at which the session was created
     created_at: Instant,
     /// The source and destination pair.
     key: SessionKey,
     /// The socket port of the session.
     socket_port: u16,
     /// The queue of packets being sent to the upstream (server)
-    pending_sends: PendingSends,
-    /// The GeoIP information of the source.
+    pending_sends: PacketQueueSender,
+    /// The `GeoIP` information of the source.
     asn_info: Option<IpNetEntry>,
     /// The socket pool of the session.
     pool: Arc<SessionPool>,
 }
 
 impl Session {
-    pub fn new(
+    pub(crate) fn new(
         key: SessionKey,
-        pending_sends: PendingSends,
+        pending_sends: PacketQueueSender,
         socket_port: u16,
         pool: Arc<SessionPool>,
         asn_info: Option<IpNetEntry>,
@@ -545,7 +538,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.release()
+        self.release();
     }
 }
 
@@ -578,11 +571,11 @@ impl Loggable for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::{alloc_buffer, available_addr, AddressType, TestHelper};
+    use crate::test::{AddressType, TestHelper, alloc_buffer, available_addr};
     use std::sync::Arc;
 
-    async fn new_pool() -> (Arc<SessionPool>, PendingSends) {
-        let (pending_sends, _srecv) = PendingSends::new(1).unwrap();
+    async fn new_pool() -> (Arc<SessionPool>, PacketQueueSender) {
+        let (pending_sends, _srecv) = crate::net::queue(1).unwrap();
         (
             SessionPool::new(
                 Arc::new(Config::default_agent()),
@@ -699,7 +692,7 @@ mod tests {
         let socket1 = pool.get(key1).unwrap();
 
         let task = tokio::spawn(async move {
-            let _ = socket1;
+            drop(socket1);
         });
 
         let _socket2 = pool.get(key2).unwrap();
@@ -724,7 +717,7 @@ mod tests {
         let socket1 = pool.get(key1).unwrap();
 
         let task = tokio::spawn(async move {
-            let _ = socket1;
+            drop(socket1);
         });
 
         let _socket2 = pool.get(key2).unwrap();

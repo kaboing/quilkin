@@ -14,18 +14,18 @@
  *  limitations under the License.
  */
 
-pub use super::agent::Ready;
 use super::RunArgs;
+pub use super::agent::Ready;
 pub use crate::{
     config::Providers,
-    net::{endpoint::Locality, DualStackLocalSocket},
+    net::{DualStackLocalSocket, endpoint::Locality},
 };
 
 pub struct Manage {
     pub locality: Option<Locality>,
     pub relay_servers: Vec<tonic::transport::Endpoint>,
     pub provider: Providers,
-    pub listener: crate::net::TcpListener,
+    pub port: u16,
     pub address_selector: Option<crate::config::AddressSelector>,
 }
 
@@ -39,27 +39,34 @@ impl Manage {
             mut shutdown_rx,
         }: RunArgs<Ready>,
     ) -> crate::Result<()> {
+        let Some(clusters) = config.dyn_cfg.clusters() else {
+            eyre::bail!("clusters were not configured, this is a configuration issue");
+        };
+
         if let Some(locality) = &self.locality {
-            config
-                .clusters
-                .modify(|map| map.update_unlocated_endpoints(locality.clone()));
+            clusters.modify(|map| map.update_unlocated_endpoints(None, locality.clone()));
         }
 
-        let provider_task = self.provider.spawn(
-            config.clone(),
-            ready.provider_is_healthy.clone(),
-            self.locality,
-            self.address_selector,
-            false,
-        );
+        let provider_task = match self.provider {
+            Providers::Agones {
+                config_namespace,
+                gameservers_namespace,
+            } => crate::config::providersv2::Providers::default()
+                .k8s()
+                .k8s_namespace(config_namespace.unwrap_or_default())
+                .agones()
+                .agones_namespace(gameservers_namespace),
+            Providers::File { path } => crate::config::providersv2::Providers::default()
+                .fs()
+                .fs_path(path),
+        }
+        .spawn_providers(&config, ready.provider_is_healthy.clone(), self.locality);
 
         let _relay_stream = if !self.relay_servers.is_empty() {
             tracing::info!("connecting to relay server");
-            let client = crate::net::xds::client::MdsClient::connect(
-                String::clone(&config.id.load()),
-                self.relay_servers,
-            )
-            .await?;
+            let client =
+                crate::net::xds::client::MdsClient::connect(config.id(), self.relay_servers)
+                    .await?;
 
             // Attempt to connect to a delta stream if the relay has one
             // available, otherwise fallback to the regular aggregated stream
@@ -67,25 +74,18 @@ impl Manage {
                 client
                     .delta_stream(config.clone(), ready.relay_is_healthy.clone())
                     .await
-                    .map_err(|_| eyre::eyre!("failed to acquire delta stream"))?,
+                    .map_err(|_err| eyre::eyre!("failed to acquire delta stream"))?,
             )
         } else {
             None
         };
 
-        use futures::TryFutureExt as _;
-        let server_task = tokio::spawn(
-            crate::net::xds::server::ControlPlane::from_arc(
-                config,
-                crate::components::admin::IDLE_REQUEST_INTERVAL,
-            )
-            .management_server(self.listener)?,
-        )
-        .map_err(From::from)
-        .and_then(std::future::ready);
+        crate::cli::Service::default()
+            .xds()
+            .xds_port(self.port)
+            .spawn_services(&config, &shutdown_rx)?;
 
         tokio::select! {
-            result = server_task => result,
             result = provider_task => result?,
             result = shutdown_rx.changed() => result.map_err(From::from),
         }

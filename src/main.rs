@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#[allow(clippy::exit)]
 fn main() {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -28,13 +29,17 @@ fn main() {
         .block_on(async {
             // Unwrap is safe here as it will only fail if called more than once.
             stable_eyre::install().unwrap();
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .unwrap();
 
-            match <quilkin::Cli as clap::Parser>::parse().drive(None).await {
+            match <quilkin::Cli as clap::Parser>::parse().drive().await {
                 Ok(()) => std::process::exit(0),
                 Err(error) => {
-                    tracing::error!(%error, error_debug=?error, "fatal error");
+                    tracing::error!(?error, "fatal error");
+
                     std::process::exit(-1)
                 }
             }
-        })
+        });
 }

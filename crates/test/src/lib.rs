@@ -1,14 +1,17 @@
 use quilkin::{
+    Config,
     collections::{BufferPool, PoolBuffer},
     components::{self, RunArgs},
     config::Providers,
     net::TcpListener,
+    signal::ShutdownTx,
     test::TestConfig,
-    Config, ShutdownTx,
 };
 pub use serde_json::json;
 use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
+
+pub mod xdp_util;
 
 pub static BUFFER_POOL: once_cell::sync::Lazy<Arc<BufferPool>> =
     once_cell::sync::Lazy::new(|| Arc::new(BufferPool::default()));
@@ -48,10 +51,10 @@ macro_rules! temp_file {
     }};
 }
 
-pub use tracing::{subscriber::DefaultGuard, Level};
+pub use tracing::{Level, subscriber::DefaultGuard};
 
 pub fn init_logging(level: Level, test_pkg: &'static str) -> DefaultGuard {
-    use tracing_subscriber::{layer::SubscriberExt as _, Layer as _};
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
     let layer = tracing_subscriber::fmt::layer()
         .with_test_writer()
         .with_filter(tracing_subscriber::filter::LevelFilter::from_level(level))
@@ -160,7 +163,7 @@ pub struct ConfigFile {
 impl ConfigFile {
     pub fn update(&mut self, update: impl FnOnce(&mut TestConfig)) {
         update(&mut self.config);
-        self.config.write_to_file(&self.path)
+        self.config.write_to_file(&self.path);
     }
 }
 
@@ -307,11 +310,8 @@ impl Pail {
             PailConfig::Relay(rpc) => {
                 use components::relay;
 
-                let xds_listener = TcpListener::bind(None).unwrap();
-                let mds_listener = TcpListener::bind(None).unwrap();
-
-                let xds_port = xds_listener.port();
-                let mds_port = mds_listener.port();
+                let xds_port = TcpListener::bind(None).unwrap().port();
+                let mds_port = TcpListener::bind(None).unwrap().port();
 
                 let path = td.join(spc.name);
                 let mut tc = rpc.config.unwrap_or_default();
@@ -321,15 +321,16 @@ impl Pail {
                 let config_path = path.clone();
 
                 let (shutdown, shutdown_rx) =
-                    quilkin::make_shutdown_channel(quilkin::ShutdownKind::Testing);
+                    quilkin::signal::channel(quilkin::signal::ShutdownKind::Testing);
 
                 let config = Arc::new(Config::default_non_agent());
-                config.id.store(Arc::new(spc.name.into()));
+                config.dyn_cfg.id.store(Arc::new(spc.name.into()));
 
                 let task = tokio::spawn(
                     relay::Relay {
-                        xds_listener,
-                        mds_listener,
+                        xds_port,
+                        mds_port,
+                        locality: None,
                         provider: Some(Providers::File { path }),
                     }
                     .run(RunArgs {
@@ -390,15 +391,15 @@ impl Pail {
                     .collect();
 
                 let (shutdown, shutdown_rx) =
-                    quilkin::make_shutdown_channel(quilkin::ShutdownKind::Testing);
+                    quilkin::signal::channel(quilkin::signal::ShutdownKind::Testing);
 
-                let qcmp_socket =
-                    quilkin::net::raw_socket_with_reuse(0).expect("failed to bind qcmp socket");
-                let qcmp_port = quilkin::net::socket_port(&qcmp_socket);
+                let port = quilkin::net::socket_port(
+                    &quilkin::net::raw_socket_with_reuse(0).expect("failed to bind qcmp socket"),
+                );
 
                 let config_path = path.clone();
                 let config = Arc::new(Config::default_agent());
-                config.id.store(Arc::new(spc.name.into()));
+                config.dyn_cfg.id.store(Arc::new(spc.name.into()));
                 let acfg = config.clone();
 
                 let task = tokio::spawn(async move {
@@ -406,7 +407,7 @@ impl Pail {
                         locality: None,
                         icao_code: Some(apc.icao_code),
                         relay_servers,
-                        qcmp_socket,
+                        port,
                         provider: Some(Providers::File { path }),
                         address_selector: None,
                     }
@@ -419,7 +420,7 @@ impl Pail {
                 });
 
                 Self::Agent(AgentPail {
-                    qcmp_port,
+                    qcmp_port: port,
                     task,
                     shutdown,
                     config_file: Some(ConfigFile {
@@ -455,7 +456,7 @@ impl Pail {
                     .collect();
 
                 let (shutdown, shutdown_rx) =
-                    quilkin::make_shutdown_channel(quilkin::ShutdownKind::Testing);
+                    quilkin::signal::channel(quilkin::signal::ShutdownKind::Testing);
 
                 let (tx, orx) = tokio::sync::oneshot::channel();
 
@@ -467,7 +468,11 @@ impl Pail {
                     }
 
                     if !cfg.filters.is_empty() {
-                        config.filters.store(Arc::new(cfg.filters));
+                        config
+                            .dyn_cfg
+                            .filters()
+                            .unwrap()
+                            .store(Arc::new(cfg.filters));
                     }
                 }
 
@@ -487,11 +492,13 @@ impl Pail {
 
                 if !endpoints.is_empty() {
                     config
-                        .clusters
+                        .dyn_cfg
+                        .clusters()
+                        .unwrap()
                         .modify(|clusters| clusters.insert_default(endpoints));
                 }
 
-                config.id.store(Arc::new(spc.name.into()));
+                config.dyn_cfg.id.store(Arc::new(spc.name.into()));
                 let pconfig = config.clone();
 
                 let (rttx, rtrx) = tokio::sync::mpsc::unbounded_channel();
@@ -499,14 +506,12 @@ impl Pail {
                 let task = tokio::spawn(async move {
                     components::proxy::Proxy {
                         num_workers: NonZeroUsize::new(1).unwrap(),
-                        mmdb: None,
-                        to: Vec::new(),
-                        to_tokens: None,
                         management_servers,
-                        socket,
+                        socket: Some(socket),
                         qcmp,
                         phoenix,
                         notifier: Some(rttx),
+                        ..Default::default()
                     }
                     .run(
                         RunArgs {
@@ -669,7 +674,7 @@ impl Sandbox {
         match pail {
             Pail::Relay(rp) => rp.config_file.take().unwrap(),
             Pail::Agent(ap) => ap.config_file.take().unwrap(),
-            _ => unimplemented!("no config_file for this pail"),
+            _ => unreachable!("no config_file for this pail"),
         }
     }
 
@@ -694,7 +699,7 @@ impl Sandbox {
     /// Sleeps for the specified number of milliseconds
     #[inline]
     pub async fn sleep(&self, ms: u64) {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
     /// Runs a future, expecting it complete before the specified timeout
@@ -730,4 +735,22 @@ impl Sandbox {
             .await
             .expect_err("expected future to timeout");
     }
+}
+
+#[macro_export]
+macro_rules! filter_chain {
+    ([$($kind:ident => $filter:expr,)*]) => {
+        quilkin::filters::FilterChain::testing([
+            $(
+                quilkin::filters::FilterInstance::testing(quilkin::filters::$kind::testing($filter))
+            ),*
+        ])
+    };
+    ([$($kind:ident => $filter:expr),*]) => {
+        quilkin::filters::FilterChain::testing([
+            $(
+                quilkin::filters::FilterInstance::testing(quilkin::filters::$kind::testing($filter))
+            ),*
+        ])
+    };
 }

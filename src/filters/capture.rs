@@ -54,6 +54,10 @@ impl Capture {
             metadata_key: config.metadata_key,
         }
     }
+
+    pub fn testing(config: Config) -> Self {
+        Self::new(config)
+    }
 }
 
 impl Filter for Capture {
@@ -99,7 +103,7 @@ impl StaticFilter for Capture {
 mod tests {
     use super::CAPTURED_BYTES;
     use crate::{
-        net::endpoint::{metadata::Value, Endpoint},
+        net::endpoint::{Endpoint, metadata::Value},
         test::{alloc_buffer, assert_write_no_change},
     };
 
@@ -170,14 +174,16 @@ mod tests {
             [Endpoint::new("127.0.0.1:81".parse().unwrap())].into(),
         );
         let mut dest = Vec::new();
-        assert!(filter
-            .read(&mut ReadContext::new(
-                &endpoints,
-                (std::net::Ipv4Addr::LOCALHOST, 80).into(),
-                alloc_buffer(b"abc"),
-                &mut dest,
-            ))
-            .is_err());
+        assert!(
+            filter
+                .read(&mut ReadContext::new(
+                    &endpoints,
+                    (std::net::Ipv4Addr::LOCALHOST, 80).into(),
+                    alloc_buffer(b"abc"),
+                    &mut dest,
+                ))
+                .is_err()
+        );
     }
 
     #[tokio::test]

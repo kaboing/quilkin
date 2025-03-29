@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use std::{io, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use futures::{Stream, TryFutureExt};
 use tokio_stream::StreamExt;
@@ -22,10 +22,10 @@ use tracing_futures::Instrument;
 
 use crate::{
     discovery::{
+        DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
         aggregated_discovery_service_server::{
             AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
         },
-        DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
     },
     generated::quilkin::relay::v1alpha1::aggregated_control_plane_discovery_service_server::{
         AggregatedControlPlaneDiscoveryService, AggregatedControlPlaneDiscoveryServiceServer,
@@ -33,6 +33,70 @@ use crate::{
     metrics,
     net::TcpListener,
 };
+
+const FORWARDED: &str = "forwarded";
+const X_FORWARDED_FOR: &str = "x-forwarded-for";
+const ENVOY_EXTERNAL_ADDRESS: &str = "x-envoy-external-address";
+
+/// Returns the true external address of a xDS client if available, checking for
+/// if we are behind a proxy and need to parse the forwarded headers. The header
+/// precendence is as follows:
+///
+/// - Forwarded
+/// - X-Forwarded-For
+/// - X-Envoy-External-Address
+/// - Host
+fn get_external_remote_addr<T>(request: &tonic::Request<T>) -> Option<std::net::IpAddr> {
+    let metadata = request.metadata();
+    let forwarded_for = metadata
+        .get(FORWARDED)
+        .and_then(|header| {
+            header.to_str().ok().and_then(|value| {
+                forwarded_header_value::ForwardedHeaderValue::from_forwarded(value).ok()
+            })
+        })
+        .and_then(|header| header.remotest().forwarded_for_ip());
+
+    forwarded_for
+        .or_else(|| {
+            metadata
+                .get(X_FORWARDED_FOR)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(",").next().and_then(|value| value.parse().ok()))
+        })
+        .or_else(|| {
+            metadata
+                .get(ENVOY_EXTERNAL_ADDRESS)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+        })
+        .or_else(|| request.remote_addr().map(|addr| addr.ip()))
+        .map(|ip| ip.to_canonical())
+}
+
+#[derive(Clone)]
+pub struct TlsIdentity {
+    identity: tonic::transport::Identity,
+}
+
+impl TlsIdentity {
+    pub fn from_raw(cert: &[u8], key: &[u8]) -> Self {
+        Self {
+            identity: tonic::transport::Identity::from_pem(cert, key),
+        }
+    }
+
+    pub fn from_files(cert: &std::path::Path, key: &std::path::Path) -> eyre::Result<Self> {
+        use eyre::WrapErr as _;
+        let cert = std::fs::read(cert)
+            .with_context(|| format!("failed to read PEM certificate from {cert:?}"))?;
+        let key = std::fs::read(key).with_context(|| format!("failed to read key from {key:?}"))?;
+
+        Ok(Self {
+            identity: tonic::transport::Identity::from_pem(cert, key),
+        })
+    }
+}
 
 const VERSION_INFO: &str = "9";
 
@@ -66,10 +130,17 @@ impl<C: crate::config::Configuration> ControlPlane<C> {
         }
     }
 
+    fn server_builder() -> tonic::transport::Server {
+        tonic::transport::Server::builder()
+            .http2_keepalive_interval(Some(crate::HTTP2_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(crate::HTTP2_KEEPALIVE_TIMEOUT))
+    }
+
     pub fn management_server(
         mut self,
         listener: TcpListener,
-    ) -> io::Result<impl std::future::Future<Output = crate::Result<()>>> {
+        tls: Option<TlsIdentity>,
+    ) -> eyre::Result<impl std::future::Future<Output = crate::Result<()>>> {
         self.is_relay = false;
         tokio::spawn({
             let this = self.clone();
@@ -78,7 +149,15 @@ impl<C: crate::config::Configuration> ControlPlane<C> {
 
         let server = AggregatedDiscoveryServiceServer::new(self)
             .max_encoding_message_size(crate::config::max_grpc_message_size());
-        let server = tonic::transport::Server::builder().add_service(server);
+        let builder = Self::server_builder();
+
+        let mut builder = if let Some(tls) = tls {
+            builder.tls_config(tonic::transport::ServerTlsConfig::new().identity(tls.identity))?
+        } else {
+            builder
+        };
+
+        let server = builder.add_service(server);
         tracing::info!("serving management server on port `{}`", listener.port());
         Ok(server
             .serve_with_incoming(listener.into_stream()?)
@@ -88,7 +167,8 @@ impl<C: crate::config::Configuration> ControlPlane<C> {
     pub fn relay_server(
         mut self,
         listener: TcpListener,
-    ) -> io::Result<impl std::future::Future<Output = crate::Result<()>>> {
+        tls: Option<TlsIdentity>,
+    ) -> eyre::Result<impl std::future::Future<Output = crate::Result<()>>> {
         self.is_relay = true;
         tokio::spawn({
             let this = self.clone();
@@ -97,7 +177,15 @@ impl<C: crate::config::Configuration> ControlPlane<C> {
 
         let server = AggregatedControlPlaneDiscoveryServiceServer::new(self)
             .max_encoding_message_size(crate::config::max_grpc_message_size());
-        let server = tonic::transport::Server::builder().add_service(server);
+        let builder = Self::server_builder();
+
+        let mut builder = if let Some(tls) = tls {
+            builder.tls_config(tonic::transport::ServerTlsConfig::new().identity(tls.identity))?
+        } else {
+            builder
+        };
+
+        let server = builder.add_service(server);
         tracing::info!("serving relay server on port `{}`", listener.port());
         Ok(server
             .serve_with_incoming(listener.into_stream()?)
@@ -121,7 +209,7 @@ impl<C: crate::config::Configuration> ControlPlane<C> {
         &self,
         mut streaming: S,
     ) -> Result<
-        impl Stream<Item = Result<DeltaDiscoveryResponse, tonic::Status>> + Send,
+        impl Stream<Item = Result<DeltaDiscoveryResponse, tonic::Status>> + Send + use<S, C>,
         tonic::Status,
     >
     where
@@ -317,7 +405,7 @@ impl<C: crate::config::Configuration> ControlPlane<C> {
                             continue;
                         }
 
-                        let id = client_request.node.as_ref().map(|node| node.id.as_str()).unwrap_or(node_id.as_str());
+                        let id = client_request.node.as_ref().map_or(node_id.as_str(), |node| node.id.as_str());
 
                         tracing::trace!(resource_type = client_request.type_url, "new delta message");
 
@@ -409,8 +497,7 @@ impl<C: crate::config::Configuration> AggregatedControlPlaneDiscoveryService for
         &self,
         responses: tonic::Request<tonic::Streaming<DeltaDiscoveryResponse>>,
     ) -> Result<tonic::Response<Self::DeltaAggregatedResourcesStream>, tonic::Status> {
-        let remote_addr = responses
-            .remote_addr()
+        let remote_addr = get_external_remote_addr(&responses)
             .ok_or_else(|| tonic::Status::invalid_argument("no remote address available"))?;
 
         tracing::info!("control plane discovery delta stream attempt");
@@ -466,35 +553,116 @@ impl<C: crate::config::Configuration> AggregatedControlPlaneDiscoveryService for
                     None,
                 );
 
-                loop {
+                let res = loop {
                     let next_response =
                         tokio::time::timeout(idle_request_interval, response_stream.next());
 
-                    if let Ok(Some(ack)) = next_response.await {
-                        tracing::trace!("sending ack request");
-                        ds.send_response(ack?)
+                    match next_response.await {
+                        Ok(Some(Ok(ack))) => {
+                            tracing::trace!("sending ack request");
+                            ds.send_response(ack).await.map_err(|_err| {
+                                tonic::Status::internal("this should not be reachable")
+                            })?;
+                        }
+                        Ok(Some(Err(error))) => {
+                            if crate::is_broken_pipe(&error) {
+                                break Ok(());
+                            } else {
+                                break Err(eyre::eyre!(error));
+                            }
+                        }
+                        Ok(None) => {
+                            break Ok(());
+                        }
+                        Err(_) => {
+                            tracing::trace!("exceeded idle interval, sending request");
+                            ds.refresh(
+                                &identifier,
+                                config.interested_resources(&server_version).collect(),
+                                &local,
+                            )
                             .await
-                            .map_err(|_| tonic::Status::internal("this should not be reachable"))?;
-                    } else {
-                        tracing::trace!("exceeded idle interval, sending request");
-                        ds.refresh(
-                            &identifier,
-                            config.interested_resources(&server_version).collect(),
-                            &local,
-                        )
-                        .await
-                        .map_err(|error| tonic::Status::internal(error.to_string()))?;
+                            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+                        }
                     }
+                };
+
+                if res.is_ok() {
+                    tracing::info!("xds stream terminated");
                 }
+
+                local.clear(&config, Some(remote_addr));
+
+                res
             }
             .instrument(tracing::trace_span!("handle_delta_discovery_response")),
         );
 
         Ok(tonic::Response::new(Box::pin(async_stream::stream! {
             loop {
-                let Some(req) = request_stream.recv().await else { break; };
+                let Some(req) = request_stream.recv().await else {
+                    break;
+                };
                 yield Ok(req);
             }
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_external_address() {
+        let mut request = tonic::Request::new("");
+
+        assert_eq!(None, get_external_remote_addr(&request));
+
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some((std::net::Ipv4Addr::LOCALHOST, 8888).into()),
+            });
+
+        assert_eq!(
+            Some(std::net::Ipv4Addr::LOCALHOST.into()),
+            get_external_remote_addr(&request)
+        );
+
+        request
+            .metadata_mut()
+            .insert(ENVOY_EXTERNAL_ADDRESS, "127.0.0.2".parse().unwrap());
+        assert_eq!(
+            Some([127, 0, 0, 2].into()),
+            get_external_remote_addr(&request)
+        );
+
+        request
+            .metadata_mut()
+            .insert(ENVOY_EXTERNAL_ADDRESS, "::ffff:127.0.0.2".parse().unwrap());
+        assert_eq!(
+            Some([127, 0, 0, 2].into()),
+            get_external_remote_addr(&request)
+        );
+
+        request.metadata_mut().insert(
+            X_FORWARDED_FOR,
+            "127.0.0.3,255.255.255.255".parse().unwrap(),
+        );
+        assert_eq!(
+            Some([127, 0, 0, 3].into()),
+            get_external_remote_addr(&request)
+        );
+
+        request.metadata_mut().insert(
+            FORWARDED,
+            "for=127.0.0.4,for=255.255.255.255".parse().unwrap(),
+        );
+        assert_eq!(
+            Some([127, 0, 0, 4].into()),
+            get_external_remote_addr(&request)
+        );
     }
 }

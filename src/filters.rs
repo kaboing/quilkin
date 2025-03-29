@@ -25,7 +25,6 @@ mod set;
 mod write;
 
 pub mod capture;
-pub mod compress;
 pub mod concatenate;
 pub mod debug;
 pub mod drop;
@@ -51,7 +50,6 @@ pub mod prelude {
 #[doc(inline)]
 pub use self::{
     capture::Capture,
-    compress::Compress,
     concatenate::Concatenate,
     debug::Debug,
     drop::Drop,
@@ -60,8 +58,8 @@ pub use self::{
     firewall::Firewall,
     load_balancer::LoadBalancer,
     local_rate_limit::LocalRateLimit,
-    pass::Pass,
     r#match::Match,
+    pass::Pass,
     read::ReadContext,
     registry::FilterRegistry,
     set::{FilterMap, FilterSet},
@@ -70,7 +68,7 @@ pub use self::{
     write::WriteContext,
 };
 
-use crate::test::TestFilter;
+pub use crate::test::TestFilter;
 
 pub use self::chain::FilterChain;
 pub use crate::components::proxy::packet_router::{Packet, PacketMut};
@@ -78,7 +76,6 @@ pub use crate::components::proxy::packet_router::{Packet, PacketMut};
 #[enum_dispatch::enum_dispatch(Filter)]
 pub enum FilterKind {
     Capture,
-    Compress,
     Concatenate,
     Debug,
     Drop,

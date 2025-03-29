@@ -21,15 +21,61 @@ use std::{collections::BTreeSet, sync::Arc};
 use futures::Stream;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{core::DeserializeGuard, runtime::watcher::Event};
+use kube_leader_election::{LeaseLock, LeaseLockParams};
 
 use agones::GameServer;
 
-use crate::net::endpoint::Locality;
+use crate::{
+    config, metrics,
+    net::{ClusterMap, endpoint::Locality},
+};
 
+const CONFIGMAP: &str = "v1/ConfigMap";
+const GAMESERVER: &str = "agones.dev/v1/GameServer";
+
+fn track_event<T>(kind: &'static str, event: Event<T>) -> Event<T> {
+    let ty = match &event {
+        Event::Apply(_) => "apply",
+        Event::Init => "init",
+        Event::InitApply(_) => "init-apply",
+        Event::InitDone => "init-done",
+        Event::Delete(_) => "done",
+    };
+
+    metrics::k8s::events_total(kind, ty).inc();
+    event
+}
+
+pub(crate) async fn update_leader_lock(
+    client: kube::Client,
+    namespace: impl AsRef<str>,
+    holder_id: impl Into<String>,
+    leader_lock: config::LeaderLock,
+) -> crate::Result<()> {
+    const LEASE_NAME: &str = "quilkin-mds-leader-lease";
+    let leadership = LeaseLock::new(
+        client,
+        namespace.as_ref(),
+        LeaseLockParams {
+            holder_id: holder_id.into(),
+            lease_name: LEASE_NAME.into(),
+            lease_ttl: std::time::Duration::from_millis(750),
+        },
+    );
+
+    loop {
+        match leadership.try_acquire_or_renew().await {
+            Ok(ll) => leader_lock.store(ll.acquired_lease),
+            Err(error) => tracing::warn!(%error),
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
 pub fn update_filters_from_configmap(
     client: kube::Client,
     namespace: impl AsRef<str>,
-    config: Arc<crate::Config>,
+    filters: config::Slot<crate::filters::FilterChain>,
 ) -> impl Stream<Item = crate::Result<(), eyre::Error>> {
     async_stream::stream! {
         let mut cmap = None;
@@ -39,12 +85,13 @@ pub fn update_filters_from_configmap(
             let event = match event {
                 Ok(event) => event,
                 Err(error) => {
+                    metrics::k8s::errors_total(CONFIGMAP, &error).inc();
                     yield Err(error.into());
                     continue;
                 }
             };
 
-            let configmap = match event {
+            let configmap = match track_event(CONFIGMAP, event) {
                 Event::Apply(configmap) => configmap,
                 Event::Init => { yield Ok(()); continue; }
                 Event::InitApply(configmap) => {
@@ -63,7 +110,8 @@ pub fn update_filters_from_configmap(
                     }
                 }
                 Event::Delete(_) => {
-                    config.filters.remove();
+                    metrics::k8s::filters(false);
+                    filters.remove();
                     yield Ok(());
                     continue;
                 }
@@ -73,13 +121,14 @@ pub fn update_filters_from_configmap(
             let data = data.get("quilkin.yaml").ok_or_else(|| eyre::eyre!("quilkin.yaml property not found"))?;
             let data: serde_json::Map<String, serde_json::Value> = serde_yaml::from_str(data)?;
 
-            if let Some(filters) = data
+            if let Some(de_filters) = data
                 .get("filters")
                     .cloned()
                     .map(serde_json::from_value)
                     .transpose()?
             {
-                config.filters.store(Arc::new(filters));
+                metrics::k8s::filters(true);
+                filters.store(Arc::new(de_filters));
             }
 
             yield Ok(());
@@ -127,7 +176,7 @@ fn gameserver_events(
 pub fn update_endpoints_from_gameservers(
     client: kube::Client,
     namespace: impl AsRef<str>,
-    config: Arc<crate::Config>,
+    clusters: config::Watch<ClusterMap>,
     locality: Option<Locality>,
     address_selector: Option<crate::config::AddressSelector>,
 ) -> impl Stream<Item = crate::Result<(), eyre::Error>> {
@@ -136,12 +185,13 @@ pub fn update_endpoints_from_gameservers(
 
         for await event in gameserver_events(client, namespace) {
             let ads = address_selector.as_ref();
-            match event? {
+            match track_event(GAMESERVER, event?) {
                 Event::Apply(result) => {
                     let server = match result.0 {
                         Ok(server) => server,
                         Err(error) => {
                             tracing::debug!(%error, "couldn't decode gameserver event");
+                            metrics::k8s::errors_total(GAMESERVER, &error);
                             continue;
                         }
                     };
@@ -149,17 +199,20 @@ pub fn update_endpoints_from_gameservers(
                     tracing::debug!("received applied event from k8s");
                     if !server.is_allocated() {
                         yield Ok(());
+                        metrics::k8s::gameservers_total_unallocated();
                         tracing::debug!("skipping unallocated server");
                         continue;
                     }
 
                     let Some(endpoint) = server.endpoint(ads) else {
+                        metrics::k8s::gameservers_total_invalid();
                         tracing::warn!(selector=?ads, "received invalid gameserver to apply from k8s");
                         continue;
                     };
                     tracing::debug!(endpoint=%serde_json::to_value(&endpoint).unwrap(), "Adding endpoint");
-                    config.clusters.write()
-                        .replace(locality.clone(), endpoint);
+                    metrics::k8s::gameservers_total_valid();
+                    clusters.write()
+                        .replace(None, locality.clone(), endpoint);
                 }
                 Event::Init => {},
                 Event::InitApply(result) => {
@@ -173,8 +226,13 @@ pub fn update_endpoints_from_gameservers(
 
                     if server.is_allocated() {
                         if let Some(ep) = server.endpoint(ads) {
+                            metrics::k8s::gameservers_total_valid();
                             servers.insert(ep);
+                        } else {
+                            metrics::k8s::gameservers_total_invalid();
                         }
+                    } else {
+                        metrics::k8s::gameservers_total_unallocated();
                     }
                 }
                 Event::InitDone => {
@@ -185,12 +243,13 @@ pub fn update_endpoints_from_gameservers(
                         "Restarting with endpoints"
                     );
 
-                    config.clusters.write().insert(locality.clone(), std::mem::take(&mut servers));
+                    clusters.write().insert(None, locality.clone(), std::mem::take(&mut servers));
                 }
                 Event::Delete(result) => {
                     let server = match result.0 {
                         Ok(server) => server,
                         Err(error) => {
+                            metrics::k8s::errors_total(GAMESERVER, &error);
                             tracing::debug!(%error, "couldn't decode gameserver event");
                             continue;
                         }
@@ -198,13 +257,14 @@ pub fn update_endpoints_from_gameservers(
 
                     tracing::debug!("received delete event from k8s");
                     let found = if let Some(endpoint) = server.endpoint(ads) {
-                        config.clusters.write().remove_endpoint(&endpoint)
+                        clusters.write().remove_endpoint(&endpoint)
                     } else {
-                        config.clusters.write().remove_endpoint_if(|endpoint| {
+                        clusters.write().remove_endpoint_if(|endpoint| {
                             endpoint.metadata.unknown.get("name") == server.metadata.name.clone().map(From::from).as_ref()
                         })
                     };
 
+                    metrics::k8s::gameservers_deletions_total(found);
                     if !found {
                         tracing::debug!(
                             endpoint=%serde_json::to_value(server.endpoint(ads)).unwrap(),
@@ -215,7 +275,7 @@ pub fn update_endpoints_from_gameservers(
                 }
             };
 
-            config.apply_metrics();
+            crate::metrics::apply_clusters(&clusters);
             yield Ok(());
         }
     }

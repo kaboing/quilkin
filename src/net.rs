@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+pub mod packet;
+
 /// On linux spawns a io-uring runtime + thread, everywhere else spawns a regular tokio task.
 #[cfg(not(target_os = "linux"))]
 macro_rules! uring_spawn {
-    ($span:expr, $future:expr) => {{
+    ($span:expr_2021, $future:expr_2021) => {{
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         use tracing::Instrument as _;
 
@@ -40,16 +42,16 @@ macro_rules! uring_spawn {
 /// On linux spawns a io-uring task, everywhere else spawns a regular tokio task.
 #[cfg(not(target_os = "linux"))]
 macro_rules! uring_inner_spawn {
-    ($future:expr) => {
+    ($future:expr_2021) => {
         tokio::spawn($future);
     };
 }
 
-/// Allows creation of spans only when debug_assertions are enabled, to avoid
-/// hitting the cap of 4096 threads that is unconfigurable in tracing_subscriber -> sharded_slab
-/// for span ids
+/// Allows creation of spans only when `debug_assertions` are enabled, to avoid
+/// hitting the cap of 4096 threads that is unconfigurable in
+/// `tracing_subscriber` -> `sharded_slab` for span ids
 macro_rules! uring_span {
-    ($span:expr) => {{
+    ($span:expr_2021) => {{
         cfg_if::cfg_if! {
             if #[cfg(debug_assertions)] {
                 Some($span)
@@ -78,6 +80,9 @@ use socket2::{Protocol, Socket, Type};
 cfg_if::cfg_if! {
     if #[cfg(target_os = "linux")] {
         use std::net::UdpSocket;
+
+        pub(crate) mod io_uring;
+        pub mod xdp;
     } else {
         use tokio::net::UdpSocket;
     }
@@ -87,6 +92,8 @@ pub use self::{
     cluster::ClusterMap,
     endpoint::{Endpoint, EndpointAddress},
 };
+
+pub use self::packet::{PacketQueue, PacketQueueSender, queue};
 
 fn socket_with_reuse_and_address(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     cfg_if::cfg_if! {
@@ -155,7 +162,7 @@ fn enable_reuse(sock: &Socket) -> io::Result<()> {
 }
 
 /// An ipv6 socket that can accept and send data from either a local ipv4 address or ipv6 address
-/// with port reuse enabled and only_v6 set to false.
+/// with port reuse enabled and `only_v6` set to false.
 pub struct DualStackLocalSocket {
     socket: UdpSocket,
     local_addr: SocketAddr,
@@ -217,9 +224,9 @@ impl DualStackLocalSocket {
             }
         } else {
             #[inline]
-            pub fn raw_fd(&self) -> io_uring::types::Fd {
+            pub fn raw_fd(&self) -> ::io_uring::types::Fd {
                 use std::os::fd::AsRawFd;
-                io_uring::types::Fd(self.socket.as_raw_fd())
+                ::io_uring::types::Fd(self.socket.as_raw_fd())
             }
         }
     }
@@ -237,7 +244,7 @@ cfg_if::cfg_if! {
     }
 }
 
-/// The same as DualStackSocket but uses epoll instead of uring.
+/// The same as [`DualStackSocket`] but uses epoll instead of uring.
 #[derive(Debug)]
 pub struct DualStackEpollSocket {
     socket: tokio::net::UdpSocket,
@@ -309,7 +316,7 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::net::endpoint::address::AddressKind;
-    use crate::test::{available_addr, AddressType, TestHelper};
+    use crate::test::{AddressType, TestHelper, available_addr};
 
     #[tokio::test]
     async fn dual_stack_socket_reusable() {

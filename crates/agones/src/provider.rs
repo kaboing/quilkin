@@ -33,9 +33,9 @@ mod tests {
         },
     };
     use kube::{
+        Api, ResourceExt,
         api::{DeleteParams, PostParams},
         runtime::wait::await_condition,
-        Api, ResourceExt,
     };
     use serial_test::serial;
     use tokio::time::timeout;
@@ -46,9 +46,9 @@ mod tests {
     };
 
     use crate::{
-        create_agones_rbac_read_account, create_token_router_config, create_tokenised_gameserver,
-        debug_pods, is_deployment_ready, quilkin_container, quilkin_proxy_deployment, Client,
-        TOKEN_KEY,
+        Client, TOKEN_KEY, create_agones_rbac_read_account, create_token_router_config,
+        create_tokenised_gameserver, debug_pods, is_deployment_ready, quilkin_container,
+        quilkin_proxy_deployment,
     };
 
     const PROXY_DEPLOYMENT: &str = "quilkin-xds-proxies";
@@ -90,10 +90,7 @@ mod tests {
         // let's allocate this specific game server
         let mut t = TestHelper::default();
         let (mut rx, socket) = t.open_socket_and_recv_multiple_packets().await;
-        socket
-            .send_to("ALLOCATE".as_bytes(), gs_address)
-            .await
-            .unwrap();
+        socket.send_to(b"ALLOCATE", gs_address).await.unwrap();
 
         let response = timeout(SLOW, rx.recv())
             .await
@@ -169,7 +166,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Creates Quilkin xDS management instance that is in the mode to watch Agones GameServers
+    /// Creates Quilkin xDS management instance that is in the mode to watch Agones `GameServers`
     /// in this test namespace
     async fn agones_control_plane(client: &Client, deployments: Api<Deployment>) {
         let services: Api<Service> = client.namespaced_api();

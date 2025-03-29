@@ -14,7 +14,6 @@
  *  limitations under the License.
  */
 
-use arc_swap::ArcSwap;
 use once_cell::sync::Lazy;
 use prometheus::{IntCounterVec, IntGaugeVec, Registry};
 
@@ -23,22 +22,21 @@ pub(crate) const CONTROL_PLANE_LABEL: &str = "control_plane";
 pub(crate) const TYPE_LABEL: &str = "type";
 
 /// TODO: Remove and replace with a local registry.
-static REGISTRY: Lazy<ArcSwap<Registry>> = Lazy::new(|| {
-    ArcSwap::new(std::sync::Arc::new(
-        Registry::new_custom(Some("quilkin".into()), None).unwrap(),
-    ))
-});
+static REGISTRY_ONCE: parking_lot::Once = parking_lot::Once::new();
+static mut REGISTRY: Option<&'static Registry> = None;
 
-/// Sets the [prometheus::Registry] containing all the metrics
-/// registered in xDS.
-pub fn set_registry(registry: std::sync::Arc<Registry>) {
-    REGISTRY.store(registry);
+/// Sets the [`Registry`] containing all the metrics registered in xDS.
+pub fn set_registry(registry: &'static Registry) {
+    REGISTRY_ONCE.call_once(|| unsafe {
+        REGISTRY = Some(registry);
+    });
 }
 
-/// Returns the [prometheus::Registry] containing all the metrics
-/// registered in xDS.
-pub fn registry() -> arc_swap::Guard<std::sync::Arc<Registry>> {
-    REGISTRY.load()
+/// Returns the [`Registry`] containing all the metrics registered in xDS.
+#[inline]
+#[track_caller]
+pub fn registry() -> &'static Registry {
+    unsafe { REGISTRY }.expect("set_registry must be called")
 }
 
 pub(crate) fn active_control_planes(control_plane: &str) -> prometheus::IntGauge {

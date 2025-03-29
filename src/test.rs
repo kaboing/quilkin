@@ -24,11 +24,11 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     collections::BufferPool,
     config::Config,
-    filters::{prelude::*, FilterRegistry},
+    filters::{FilterRegistry, prelude::*},
+    net::DualStackEpollSocket as DualStackLocalSocket,
     net::endpoint::metadata::Value,
     net::endpoint::{Endpoint, EndpointAddress},
-    net::DualStackEpollSocket as DualStackLocalSocket,
-    ShutdownKind, ShutdownRx, ShutdownTx,
+    signal::{ShutdownKind, ShutdownRx, ShutdownTx},
 };
 
 static LOG_ONCE: Once = Once::new();
@@ -41,7 +41,7 @@ pub fn enable_log(filter: impl Into<EnvFilter>) {
             .pretty()
             .with_ansi(false)
             .with_env_filter(filter)
-            .init()
+            .init();
     });
 }
 
@@ -98,6 +98,12 @@ fn get_address(address_type: AddressType, socket: &DualStackLocalSocket) -> Sock
 // TestFilter is useful for testing that commands are executing filters appropriately.
 pub struct TestFilter;
 
+impl TestFilter {
+    pub fn testing(_config: Option<()>) -> Self {
+        Self
+    }
+}
+
 impl Filter for TestFilter {
     fn read<P: PacketMut>(&self, ctx: &mut ReadContext<'_, P>) -> Result<(), FilterError> {
         // append values on each run
@@ -151,14 +157,18 @@ pub struct OpenSocketRecvPacket {
 
 impl Drop for TestHelper {
     fn drop(&mut self) {
-        for shutdown_tx in self.server_shutdown_tx.iter_mut().flat_map(|tx| tx.take()) {
+        for shutdown_tx in self
+            .server_shutdown_tx
+            .iter_mut()
+            .filter_map(|tx| tx.take())
+        {
             shutdown_tx
                 .send(ShutdownKind::Testing)
                 .map_err(|error| {
                     tracing::warn!(
                         %error,
                         "Failed to send server shutdown over channel"
-                    )
+                    );
                 })
                 .ok();
         }
@@ -288,12 +298,13 @@ impl TestHelper {
         server: Option<crate::components::proxy::Proxy>,
         with_admin: Option<Option<SocketAddr>>,
     ) -> u16 {
-        let (shutdown_tx, shutdown_rx) = crate::make_shutdown_channel(crate::ShutdownKind::Testing);
-        self.server_shutdown_tx.push(Some(shutdown_tx));
-        let mode = crate::components::admin::Admin::Proxy(<_>::default());
+        let (shutdown_tx, shutdown_rx) =
+            crate::signal::channel(crate::signal::ShutdownKind::Testing);
+        self.server_shutdown_tx.push(Some(shutdown_tx.clone()));
+        let ready = <_>::default();
 
         if let Some(address) = with_admin {
-            mode.server(config.clone(), address);
+            crate::components::admin::server(config.clone(), ready, shutdown_tx, address);
         }
 
         let server = server.unwrap_or_else(|| {
@@ -302,20 +313,16 @@ impl TestHelper {
 
             crate::components::proxy::Proxy {
                 num_workers: std::num::NonZeroUsize::new(1).unwrap(),
-                mmdb: None,
-                management_servers: Vec::new(),
-                to: Vec::new(),
-                to_tokens: None,
-                socket: crate::net::raw_socket_with_reuse(0).unwrap(),
+                socket: Some(crate::net::raw_socket_with_reuse(0).unwrap()),
                 qcmp,
                 phoenix,
-                notifier: None,
+                ..Default::default()
             }
         });
 
         let (prox_tx, prox_rx) = tokio::sync::oneshot::channel();
 
-        let port = crate::net::socket_port(&server.socket);
+        let port = crate::net::socket_port(server.socket.as_ref().unwrap());
 
         tokio::spawn(async move {
             server
@@ -338,14 +345,13 @@ impl TestHelper {
     /// Returns a receiver subscribed to the helper's shutdown event.
     async fn get_shutdown_subscriber(&mut self) -> ShutdownRx {
         // If this is the first call, then we set up the channel first.
-        match self.shutdown_ch {
-            Some((_, ref rx)) => rx.clone(),
-            None => {
-                let ch = crate::make_shutdown_channel(crate::ShutdownKind::Testing);
-                let recv = ch.1.clone();
-                self.shutdown_ch = Some(ch);
-                recv
-            }
+        if let Some((_, rx)) = &self.shutdown_ch {
+            rx.clone()
+        } else {
+            let ch = crate::signal::channel(ShutdownKind::Testing);
+            let recv = ch.1.clone();
+            self.shutdown_ch = Some(ch);
+            recv
         }
     }
 }
@@ -437,6 +443,7 @@ impl TestConfig {
         let config = Self::default();
         config.clusters.insert(
             None,
+            None,
             [Endpoint::new((std::net::Ipv4Addr::LOCALHOST, 8080).into())].into(),
         );
         config
@@ -499,7 +506,7 @@ macro_rules! __func_name {
 /// temporary directory named after the test
 #[macro_export]
 macro_rules! temp_file {
-    ($prefix:expr) => {{
+    ($prefix:expr_2021) => {{
         let name = $crate::__func_name!();
         let name = name.strip_suffix("::{{closure}}").unwrap_or(name);
         let mut name = name.replace("::", ".");

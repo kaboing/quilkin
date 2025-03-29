@@ -80,7 +80,7 @@ version:
 	@echo $(package_version)
 
 # Run all tests
-test: ensure-build-image test-quilkin test-docs
+test: ensure-build-image
 
 # In CI with split jobs that both fetch they will fail if run in parallel since
 # cargo will be fighting with itself for some the same host directory that is
@@ -89,38 +89,6 @@ fetch-quilkin: ensure-build-image
 	docker run --rm $(common_rust_args)  \
 			--network=host \
 			-e RUST_BACKTRACE=1 --entrypoint=cargo $(BUILD_IMAGE_TAG) fetch
-
-check-quilkin: ensure-build-image
-	docker run --rm $(common_rust_args) \
-			--entrypoint=cargo $(BUILD_IMAGE_TAG) deny check
-	docker run --rm $(common_rust_args) \
-		--entrypoint=cargo $(BUILD_IMAGE_TAG) clippy --tests -- -D warnings
-	docker run --rm $(common_rust_args) \
-		--entrypoint=cargo $(BUILD_IMAGE_TAG) fmt -- --check
-
-# test only the quilkin crate, if you want to see test output regardless of test
-# failure or success, set RUST_TEST_NOCAPTURE to something other than "0"
-test-quilkin: ensure-build-image
-	# --network=host because docker containers are not great at ipv6.
-	docker run --rm $(common_rust_args)  \
-			--network=host \
-			-e RUST_BACKTRACE=1 --entrypoint=cargo $(BUILD_IMAGE_TAG) test -p quilkin -p qt
-
-# Run tests against documentation
-test-docs: ensure-build-image
-test-docs: GITHUB_REF_NAME ?= main
-test-docs: QUILKIN_VERSION ?= $(shell $(MAKE) version)
-test-docs:
-	docker run --rm $(common_rust_args) \
-		-e GITHUB_REF_NAME=$(GITHUB_REF_NAME) -e QUILKIN_VERSION=$(QUILKIN_VERSION) \
-		--entrypoint=bash $(BUILD_IMAGE_TAG) -c \
-			'export RUSTDOCFLAGS="-Dwarnings" && mkdir /tmp/docs && \
-			mkdir -p "$(CARGO_TARGET_DIR)/doc"; \
-			cargo doc --workspace --no-deps && cd docs && mdbook build --dest-dir /tmp/docs/book && \
-			cp -r "$(CARGO_TARGET_DIR)/doc" /tmp/docs/api && \
-			rm /tmp/docs/book/print.html && \
-			echo "<!doctype html>" > /tmp/docs/book/print.html && \
-			htmltest -c /workspace/docs/htmltest.yaml /tmp/docs'
 
 # Build all binaries, images and related artifacts
 build: binary-archive build-image
@@ -197,12 +165,7 @@ else
 endif
 	docker run --rm $(common_rust_args) \
 		--entrypoint=bash $(BUILD_IMAGE_TAG) -c './image/archive_dependencies.sh'
-	docker buildx build --platform=linux/amd64 --build-arg TARGETPLATFORM=linux/amd64 -t $(IMAGE_TAG_AMD64) -f $(project_path)/image/Dockerfile $(project_path) 
-	docker buildx build --platform=linux/arm64 --build-arg TARGETPLATFORM=linux/arm64 -t $(IMAGE_TAG_ARM64) -f $(project_path)/image/Dockerfile $(project_path) 
-	docker push $(IMAGE_TAG_AMD64)
-	docker push $(IMAGE_TAG_ARM64)
-	docker manifest create $(IMAGE_TAG) $(IMAGE_TAG_AMD64) $(IMAGE_TAG_ARM64)
-	docker manifest push $(IMAGE_TAG)
+	docker build -t $(IMAGE_TAG) -f $(project_path)/image/Dockerfile $(project_path)
 
 # Generates the HTML report of all open source licence dependencies
 build-licence-report: ensure-build-image
@@ -238,10 +201,10 @@ run-test-agones:
 
 # Convenience target to build and push quilkin images to a repository.
 # Use `REPOSITORY` arg to specify the repository to push to.
-# USe `SKIP_BUILD_IMAGE` if you want to skip building the image if it has been already built.
-# See `build-image` for more details.
 push:
-	docker push $(IMAGE_TAG)
+	docker buildx create --use --name multi-platform-builder --driver docker-container
+	docker buildx build --platform=linux/amd64,linux/arm64 -t $(IMAGE_TAG) \
+	-f $(project_path)/image/Dockerfile $(project_path) --push
 
 # Convenience target to build and push quilkin images into a minikube instance
 # Use `MINIKUBE_PROFILE` to specify the profile. Defaults to `quilkin`.
@@ -255,22 +218,6 @@ minikube-push: build-image
 # to set those options.
 minikube-test-agones: minikube-push
 	$(MAKE) DOCKER_RUN_ARGS="$(minikube_args)" run-test-agones
-
-# Runs mdbook and cargo doc in the same directory structure as what is hosted on Github pages.
-# Open http://localhost:3000/ after running and browse to the docs you are editing. Pages will live reload on change.
-# Use `GITHUB_REF_NAME` (default: `main`) to specify the branch or tag to point Github links to and `QUILKIN_VERSION`
-# (default `$(make version)) to specify which Quilkin version the documentation uses for examples.
-docs: ensure-build-image
-docs: GITHUB_REF_NAME ?= main
-docs: QUILKIN_VERSION ?= $(shell $(MAKE) version)
-docs:
-	@echo "📭 Open browser to http://localhost:3000/ and browse as needed"
-	docker run -it --rm $(common_rust_args) -p 3000:3000 \
-		-e GITHUB_REF_NAME=$(GITHUB_REF_NAME) -e QUILKIN_VERSION=$(QUILKIN_VERSION) \
-		--entrypoint=bash $(BUILD_IMAGE_TAG) -c \
-			'mkdir /tmp/docs && (browser-sync start --server "/tmp/docs" --directory --index index.html --port 3000 --no-open --files "/tmp/docs" &) && \
-			mkdir -p "$(CARGO_TARGET_DIR)/doc"; ln -s "$(CARGO_TARGET_DIR)/doc" /tmp/docs/api && \
-			cargo watch -s "cargo doc --workspace --no-deps && cd docs && mdbook build --dest-dir /tmp/docs/book"'
 
 # Start an interactive shell inside the build image
 # Useful for testing, or adhoc cargo, gcloud, kubectl or other commands

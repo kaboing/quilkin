@@ -2,7 +2,7 @@
 
 pub use std::{
     net::{Ipv4Addr, SocketAddr, UdpSocket},
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
 };
 
 pub const READ_QUILKIN_PORT: u16 = 9001;
@@ -138,7 +138,7 @@ pub fn read_to_end<const N: usize>(
         assert_eq!(length, N);
 
         {
-            let seq = (packet[1] as u16) << 8 | packet[0] as u16;
+            let seq = ((packet[1] as u16) << 8) | packet[0] as u16;
 
             let batch = batches.iter_mut().find(|b| b.range.contains(&seq)).unwrap();
 
@@ -296,7 +296,7 @@ impl<const N: usize> Writer<N> {
 }
 
 pub struct QuilkinLoop {
-    shutdown: Option<quilkin::ShutdownTx>,
+    shutdown: Option<quilkin::signal::ShutdownTx>,
     thread: Option<std::thread::JoinHandle<()>>,
     port: u16,
     endpoint: SocketAddr,
@@ -320,14 +320,15 @@ impl QuilkinLoop {
 
     fn spinup_inner(port: u16, endpoint: SocketAddr) -> Self {
         let (shutdown_tx, shutdown_rx) =
-            quilkin::make_shutdown_channel(quilkin::ShutdownKind::Benching);
+            quilkin::signal::channel(quilkin::signal::ShutdownKind::Benching);
 
         let thread = spawn("quilkin", move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let config = Arc::new(quilkin::Config::default_non_agent());
-            config.clusters.modify(|clusters| {
-                clusters
-                    .insert_default([quilkin::net::endpoint::Endpoint::new(endpoint.into())].into())
+            config.dyn_cfg.clusters().unwrap().modify(|clusters| {
+                clusters.insert_default(
+                    [quilkin::net::endpoint::Endpoint::new(endpoint.into())].into(),
+                );
             });
 
             let proxy = quilkin::cli::Proxy {
@@ -362,12 +363,12 @@ impl Drop for QuilkinLoop {
         let Some(stx) = self.shutdown.take() else {
             return;
         };
-        stx.send(quilkin::ShutdownKind::Benching).unwrap();
+        stx.send(quilkin::signal::ShutdownKind::Benching).unwrap();
         self.thread.take().unwrap().join().unwrap();
     }
 }
 
-use quilkin::net::{cluster::ClusterMap, endpoint::Locality, Endpoint, EndpointAddress};
+use quilkin::net::{Endpoint, EndpointAddress, cluster::ClusterMap, endpoint::Locality};
 use rand::Rng;
 use std::{
     collections::BTreeSet,
@@ -502,7 +503,7 @@ pub fn gen_endpoints(
     hasher: &mut Hasher,
     mut tg: Option<&mut TokenGenerator>,
 ) -> BTreeSet<Endpoint> {
-    let num_endpoints = rng.gen_range(100..10_000);
+    let num_endpoints = rng.random_range(100..10_000);
     hasher.write_u16(num_endpoints);
 
     let mut endpoints = BTreeSet::new();
@@ -559,7 +560,7 @@ fn write_locality(hasher: &mut Hasher, loc: &Option<Locality>) {
     if let Some(key) = loc {
         key.hash(hasher);
     } else {
-        hasher.write("None".as_bytes());
+        hasher.write(b"None");
     }
 }
 
@@ -623,18 +624,18 @@ impl Iterator for TokenGenerator {
         let mut set = Self::Item::new();
 
         let count = if let Some(range) = self.range.clone() {
-            self.rng.gen_range(range)
+            self.rng.random_range(range)
         } else {
             1
         };
 
         if let Some(prev) = &mut self.previous {
             for _ in 0..count {
-                if !prev.is_empty() && self.rng.gen_ratio(1, 10) {
-                    let prev = &prev[self.rng.gen_range(0..prev.len())];
+                if !prev.is_empty() && self.rng.random_ratio(1, 10) {
+                    let prev = &prev[self.rng.random_range(0..prev.len())];
                     set.insert(prev.clone());
                 } else {
-                    let count = self.rng.gen_range(4..20);
+                    let count = self.rng.random_range(4..20);
                     let mut v = vec![0; count];
                     self.rng.fill_bytes(&mut v);
                     prev.push(v.clone());
@@ -643,7 +644,7 @@ impl Iterator for TokenGenerator {
             }
         } else {
             for _ in 0..count {
-                let count = self.rng.gen_range(4..20);
+                let count = self.rng.random_range(4..20);
                 let mut v = vec![0; count];
                 self.rng.fill_bytes(&mut v);
                 set.insert(v);
@@ -662,7 +663,7 @@ pub fn gen_cluster_map<const S: u64>(token_kind: TokenKind) -> GenCluster {
     let mut hasher = Hasher::with_seed(S);
     let mut total_endpoints = 0;
 
-    let num_locals = rng.gen_range(10..LOCALITIES.len());
+    let num_locals = rng.random_range(10..LOCALITIES.len());
 
     // Select how many localities we want, note we add 1 since we always have a default cluster
     hasher.write_usize(num_locals + 1);
@@ -671,7 +672,7 @@ pub fn gen_cluster_map<const S: u64>(token_kind: TokenKind) -> GenCluster {
 
     for locality in LOCALITIES.choose_multiple(&mut rng, num_locals) {
         let locality = locality.parse().unwrap();
-        cm.insert(Some(locality), Default::default());
+        cm.insert(None, Some(locality), Default::default());
     }
 
     // Now actually insert the endpoints, now that the order of keys is established,
@@ -698,7 +699,7 @@ pub fn gen_cluster_map<const S: u64>(token_kind: TokenKind) -> GenCluster {
 
         let ep = gen_endpoints(&mut rng, &mut hasher, token_generator.as_mut());
         total_endpoints += ep.len();
-        cm.insert(key.clone(), ep.clone());
+        cm.insert(None, key.clone(), ep.clone());
         sets.insert(key, ep);
     }
 

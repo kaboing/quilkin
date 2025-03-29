@@ -21,12 +21,12 @@ use std::{
     str::FromStr,
 };
 
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 use crate::generated::envoy::config::core::v3::{
-    address::Address as EnvoyAddress, SocketAddress as EnvoySocketAddress,
+    SocketAddress as EnvoySocketAddress, address::Address as EnvoyAddress,
 };
 
 /// A valid socket address. This differs from `std::net::SocketAddr`, in that it
@@ -61,8 +61,8 @@ impl EndpointAddress {
     /// Returns the socket address for the endpoint, resolving any DNS entries
     /// if present.
     pub fn to_socket_addr(&self) -> std::io::Result<SocketAddr> {
-        static DNS: Lazy<TokioAsyncResolver> =
-            Lazy::new(|| TokioAsyncResolver::tokio_from_system_conf().unwrap());
+        static DNS: Lazy<TokioResolver> =
+            Lazy::new(|| TokioResolver::tokio_from_system_conf().unwrap());
 
         let ip = match &self.host {
             AddressKind::Ip(ip) => *ip,
@@ -70,30 +70,26 @@ impl EndpointAddress {
                 static CACHE: Lazy<crate::collections::ttl::TtlMap<String, IpAddr>> =
                     Lazy::new(<_>::default);
 
-                match CACHE.get(name) {
-                    Some(ip) => **ip,
-                    None => {
-                        let handle = tokio::runtime::Handle::current();
-                        let set = handle
-                            .block_on(DNS.lookup_ip(&**name))?
-                            .iter()
-                            .collect::<std::collections::HashSet<_>>();
+                if let Some(ip) = CACHE.get(name) {
+                    **ip
+                } else {
+                    let handle = tokio::runtime::Handle::current();
+                    let set = handle
+                        .block_on(DNS.lookup_ip(&**name))?
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>();
 
-                        let ip = set
-                            .iter()
-                            .find(|item| matches!(item, IpAddr::V6(_)))
-                            .or_else(|| set.iter().find(|item| matches!(item, IpAddr::V4(_))))
-                            .copied()
-                            .ok_or_else(|| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "no ip address found",
-                                )
-                            })?;
+                    let ip = set
+                        .iter()
+                        .find(|item| matches!(item, IpAddr::V6(_)))
+                        .or_else(|| set.iter().find(|item| matches!(item, IpAddr::V4(_))))
+                        .copied()
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "no ip address found")
+                        })?;
 
-                        CACHE.insert(name.clone(), ip);
-                        ip
-                    }
+                    CACHE.insert(name.clone(), ip);
+                    ip
                 }
             }
         };
@@ -236,7 +232,7 @@ impl TryFrom<EnvoySocketAddress> for EndpointAddress {
             port: match value.port_specifier {
                 Some(PortSpecifier::PortValue(value)) => value.try_into()?,
                 Some(PortSpecifier::NamedPort(_)) => {
-                    return Err(eyre::eyre!("named ports are not supported"))
+                    return Err(eyre::eyre!("named ports are not supported"));
                 }
                 None => return Err(eyre::eyre!("ports are required")),
             },
@@ -339,8 +335,7 @@ impl FromStr for AddressKind {
 
         Ok(host
             .parse()
-            .map(Self::Ip)
-            .unwrap_or_else(|_| Self::Name(s.to_owned())))
+            .map_or_else(|_err| Self::Name(s.to_owned()), Self::Ip))
     }
 }
 
@@ -383,7 +378,7 @@ mod tests {
         match endpoint.host {
             AddressKind::Name(_) => panic!("Shouldn't be a name"),
             AddressKind::Ip(ip) => {
-                assert_eq!("2345:425:2ca1::567:5673:24b5", ip.to_string())
+                assert_eq!("2345:425:2ca1::567:5673:24b5", ip.to_string());
             }
         };
         assert_eq!(25999, endpoint.port);
@@ -405,7 +400,7 @@ mod tests {
         match ak {
             AddressKind::Name(_) => panic!("Shouldn't be a name"),
             AddressKind::Ip(ip) => {
-                assert_eq!("2345:425:2ca1::567:5673:24b5", ip.to_string())
+                assert_eq!("2345:425:2ca1::567:5673:24b5", ip.to_string());
             }
         };
 
@@ -415,14 +410,14 @@ mod tests {
         match ak {
             AddressKind::Name(_) => panic!("Shouldn't be a name"),
             AddressKind::Ip(ip) => {
-                assert_eq!("2345:425:2ca1::567:5673:24b5", ip.to_string())
+                assert_eq!("2345:425:2ca1::567:5673:24b5", ip.to_string());
             }
         };
 
         let ak = "my.domain.com".parse::<AddressKind>().unwrap();
         match ak {
             AddressKind::Name(name) => {
-                assert_eq!("my.domain.com", name)
+                assert_eq!("my.domain.com", name);
             }
             AddressKind::Ip(_) => panic!("shouldn't be an ip"),
         };

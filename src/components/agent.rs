@@ -16,10 +16,10 @@
 
 use super::RunArgs;
 use crate::config::{IcaoCode, Providers};
-pub use crate::net::{endpoint::Locality, DualStackLocalSocket};
+pub use crate::net::{DualStackLocalSocket, endpoint::Locality};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -40,7 +40,7 @@ impl Ready {
 
 pub struct Agent {
     pub locality: Option<Locality>,
-    pub qcmp_socket: socket2::Socket,
+    pub port: u16,
     pub icao_code: Option<IcaoCode>,
     pub relay_servers: Vec<tonic::transport::Endpoint>,
     pub provider: Option<Providers>,
@@ -57,35 +57,35 @@ impl Agent {
             mut shutdown_rx,
         }: RunArgs<Ready>,
     ) -> crate::Result<()> {
-        {
-            let crate::config::DatacenterConfig::Agent {
-                icao_code,
-                qcmp_port,
-            } = &config.datacenter
-            else {
-                unreachable!("this should be an agent config");
-            };
-
-            qcmp_port.store(crate::net::socket_port(&self.qcmp_socket).into());
-            icao_code.store(self.icao_code.unwrap_or_default().into());
+        if let Some(agent) = config.dyn_cfg.agent() {
+            agent.qcmp_port.store(self.port.into());
+            agent
+                .icao_code
+                .store(self.icao_code.unwrap_or_default().into());
+        } else {
+            eyre::bail!("agent configuration missing");
         }
 
         let _mds_task = if !self.relay_servers.is_empty() {
-            let _provider_task = match self.provider {
-                Some(provider) => Some(provider.spawn(
-                    config.clone(),
-                    ready.provider_is_healthy.clone(),
-                    self.locality,
-                    self.address_selector,
-                    true,
-                )),
-                None => return Err(eyre::eyre!("no configuration provider given")),
+            let Some(provider) = self.provider else {
+                return Err(eyre::eyre!("no configuration provider given"));
             };
 
-            let task = crate::net::xds::client::MdsClient::connect(
-                String::clone(&config.id.load()),
-                self.relay_servers,
-            );
+            let _provider_task = match provider {
+                Providers::Agones {
+                    gameservers_namespace,
+                    ..
+                } => crate::config::providersv2::Providers::default()
+                    .agones()
+                    .agones_namespace(gameservers_namespace),
+
+                Providers::File { path } => crate::config::providersv2::Providers::default()
+                    .fs()
+                    .fs_path(path),
+            }
+            .spawn_providers(&config, ready.provider_is_healthy.clone(), self.locality);
+
+            let task = crate::net::xds::client::MdsClient::connect(config.id(), self.relay_servers);
 
             tokio::select! {
                 result = task => {
@@ -93,7 +93,7 @@ impl Agent {
 
                     // Attempt to connect to a delta stream if the relay has one
                     // available, otherwise fallback to the regular aggregated stream
-                    Some(client.delta_stream(config.clone(), ready.relay_is_healthy.clone()).await.map_err(|_| eyre::eyre!("failed to acquire delta stream"))?)
+                    Some(client.delta_stream(config.clone(), ready.relay_is_healthy.clone()).await.map_err(|_err| eyre::eyre!("failed to acquire delta stream"))?)
                 }
                 _ = shutdown_rx.changed() => return Ok(()),
             }
@@ -102,7 +102,10 @@ impl Agent {
             None
         };
 
-        crate::codec::qcmp::spawn(self.qcmp_socket, shutdown_rx.clone())?;
+        crate::cli::Service::default()
+            .qcmp()
+            .qcmp_port(self.port)
+            .spawn_services(&config, &shutdown_rx)?;
         shutdown_rx.changed().await.map_err(From::from)
     }
 }

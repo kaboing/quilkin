@@ -50,12 +50,12 @@ async fn agent_ping() {
         ..<_>::default()
     };
     let server_config = std::sync::Arc::new(quilkin::Config::default_agent());
-    let (_tx, rx) = quilkin::make_shutdown_channel(quilkin::ShutdownKind::Testing);
+    let (_tx, rx) = quilkin::signal::channel(quilkin::signal::ShutdownKind::Testing);
     tokio::spawn(async move {
         agent
-            .run(server_config, Default::default(), rx)
+            .run(None, server_config, Default::default(), rx)
             .await
-            .expect("Agent should run")
+            .expect("Agent should run");
     });
     ping(qcmp_port).await;
 }

@@ -139,7 +139,7 @@ impl<T: Default> Default for Slot<T> {
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Slot<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.load().fmt(f)
     }
 }
@@ -184,8 +184,8 @@ impl<T: JsonSchema + Default> JsonSchema for Slot<T> {
     fn schema_name() -> String {
         <Option<T>>::schema_name()
     }
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        <Option<T>>::json_schema(gen)
+    fn json_schema(r#gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        <Option<T>>::json_schema(r#gen)
     }
 
     fn is_referenceable() -> bool {

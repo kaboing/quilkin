@@ -19,6 +19,7 @@
 pub mod alloc;
 pub mod collections;
 pub(crate) mod metrics;
+pub mod signal;
 pub mod time;
 
 // Above other modules for thr `uring_spawn` macro.
@@ -49,26 +50,6 @@ pub use quilkin_macros::include_proto;
 
 pub(crate) use self::net::maxmind_db::MaxmindDb;
 
-#[derive(Copy, Clone, PartialEq, Default, Debug)]
-pub enum ShutdownKind {
-    /// Normal shutdown kind, the receiver should perform proper shutdown procedures
-    #[default]
-    Normal,
-    /// In a testing environment, some or all shutdown behavior may be skippable
-    Testing,
-    /// In a benching environment, some or all shutdown behavior may be skippable
-    Benching,
-}
-
-/// Receiver for a shutdown event.
-pub type ShutdownRx = tokio::sync::watch::Receiver<ShutdownKind>;
-pub type ShutdownTx = tokio::sync::watch::Sender<ShutdownKind>;
-
-#[inline]
-pub fn make_shutdown_channel(init: ShutdownKind) -> (ShutdownTx, ShutdownRx) {
-    tokio::sync::watch::channel(init)
-}
-
 /// A type which can be logged, usually error types.
 pub(crate) trait Loggable {
     /// Output a log.
@@ -79,7 +60,6 @@ pub(crate) trait Loggable {
 mod external_doc_tests {
     #![doc = include_str!("../docs/src/services/proxy/filters.md")]
     #![doc = include_str!("../docs/src/services/proxy/filters/capture.md")]
-    #![doc = include_str!("../docs/src/services/proxy/filters/compress.md")]
     #![doc = include_str!("../docs/src/services/proxy/filters/concatenate.md")]
     #![doc = include_str!("../docs/src/services/proxy/filters/debug.md")]
     #![doc = include_str!("../docs/src/services/proxy/filters/firewall.md")]

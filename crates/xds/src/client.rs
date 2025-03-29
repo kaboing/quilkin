@@ -15,28 +15,29 @@
  */
 
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
+use eyre::ContextCompat;
 use futures::StreamExt;
 use rand::Rng;
-use tonic::transport::{channel::Channel as TonicChannel, Endpoint, Error as TonicError};
+use tonic::transport::{Endpoint, Error as TonicError, channel::Channel as TonicChannel};
 use tracing::Instrument;
 use tryhard::{
-    backoff_strategies::{BackoffStrategy, ExponentialBackoff},
     RetryFutureConfig, RetryPolicy,
+    backoff_strategies::{BackoffStrategy, ExponentialBackoff},
 };
 
 use crate::{
+    Result,
     core::Node,
     discovery::{
-        aggregated_discovery_service_client::AggregatedDiscoveryServiceClient,
         DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
+        aggregated_discovery_service_client::AggregatedDiscoveryServiceClient,
     },
     generated::quilkin::relay::v1alpha1::aggregated_control_plane_discovery_service_client::AggregatedControlPlaneDiscoveryServiceClient,
-    Result,
 };
 
 type AdsGrpcClient = AggregatedDiscoveryServiceClient<TonicChannel>;
@@ -69,10 +70,14 @@ impl ServiceClient for AdsGrpcClient {
     async fn connect_to_endpoint(
         endpoint: tonic::transport::Endpoint,
     ) -> Result<Self, tonic::transport::Error> {
-        Ok(AdsGrpcClient::connect(endpoint)
-            .await?
-            .max_decoding_message_size(crate::config::max_grpc_message_size())
-            .max_encoding_message_size(crate::config::max_grpc_message_size()))
+        Ok(AdsGrpcClient::connect(
+            endpoint
+                .tcp_keepalive(Some(crate::HTTP2_KEEPALIVE_INTERVAL))
+                .timeout(crate::HTTP2_KEEPALIVE_TIMEOUT),
+        )
+        .await?
+        .max_decoding_message_size(crate::config::max_grpc_message_size())
+        .max_encoding_message_size(crate::config::max_grpc_message_size()))
     }
 
     async fn stream_requests<S: tonic::IntoStreamingRequest<Message = Self::Request> + Send>(
@@ -91,10 +96,14 @@ impl ServiceClient for MdsGrpcClient {
     async fn connect_to_endpoint(
         endpoint: tonic::transport::Endpoint,
     ) -> Result<Self, tonic::transport::Error> {
-        Ok(MdsGrpcClient::connect(endpoint)
-            .await?
-            .max_decoding_message_size(crate::config::max_grpc_message_size())
-            .max_encoding_message_size(crate::config::max_grpc_message_size()))
+        Ok(MdsGrpcClient::connect(
+            endpoint
+                .tcp_keepalive(Some(crate::HTTP2_KEEPALIVE_INTERVAL))
+                .timeout(crate::HTTP2_KEEPALIVE_TIMEOUT),
+        )
+        .await?
+        .max_decoding_message_size(crate::config::max_grpc_message_size())
+        .max_encoding_message_size(crate::config::max_grpc_message_size()))
     }
 
     async fn stream_requests<S: tonic::IntoStreamingRequest<Message = Self::Request> + Send>(
@@ -145,20 +154,20 @@ impl<C: ServiceClient> Client<C> {
             // max delay + jitter of up to 2 seconds
             let mut delay = backoff.delay(attempt, &error).min(BACKOFF_MAX_DELAY);
             delay += Duration::from_millis(
-                rand::thread_rng().gen_range(0..BACKOFF_MAX_JITTER.as_millis() as _),
+                rand::rng().random_range(0..BACKOFF_MAX_JITTER.as_millis() as _),
             );
 
             match error {
-                RpcSessionError::InvalidEndpoint(ref error) => {
+                RpcSessionError::InvalidEndpoint(error) => {
                     tracing::error!(?error, "Error creating endpoint");
                     // Do not retry if this is an invalid URL error that we cannot recover from.
                     RetryPolicy::Break
                 }
-                RpcSessionError::InitialConnect(ref error) => {
+                RpcSessionError::InitialConnect(error) => {
                     tracing::warn!(?error, "Unable to connect to the XDS server");
                     RetryPolicy::Delay(delay)
                 }
-                RpcSessionError::Receive(ref status) => {
+                RpcSessionError::Receive(status) => {
                     tracing::warn!(status = ?status, "Failed to receive response from XDS server");
                     RetryPolicy::Delay(delay)
                 }
@@ -216,7 +225,12 @@ impl MdsClient {
         config: Arc<C>,
         is_healthy: Arc<AtomicBool>,
     ) -> Result<DeltaSubscription, Self> {
+        const LEADERSHIP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
         let identifier = String::from(&*self.identifier);
+
+        while config.is_leader() == Some(false) {
+            tokio::time::sleep(LEADERSHIP_CHECK_INTERVAL).await;
+        }
 
         let (mut ds, mut stream) =
             match DeltaServerStream::connect(self.client.clone(), identifier.clone()).await {
@@ -236,6 +250,12 @@ impl MdsClient {
                 tracing::trace!("starting relay client delta stream task");
 
                 loop {
+                    if config.is_leader() == Some(false) {
+                        tracing::debug!("not leader, delaying task");
+                        tokio::time::sleep(LEADERSHIP_CHECK_INTERVAL).await;
+                        continue;
+                    }
+
                     {
                         let control_plane = super::server::ControlPlane::from_arc(
                             config.clone(),
@@ -251,14 +271,23 @@ impl MdsClient {
                         let mut stream = control_plane.delta_aggregated_resources(stream).await?;
                         is_healthy.store(true, Ordering::SeqCst);
 
-                        while let Some(result) = stream.next().await {
+                        loop {
+                            if config.is_leader() == Some(false) {
+                                tracing::warn!("lost leader lock mid-stream, disconnecting");
+                                break;
+                            }
+
+                            let Some(result) = stream.next().await else {
+                                break;
+                            };
+
                             let response = result?;
                             tracing::trace!("received delta discovery response");
                             ds.send_response(response).await?;
                         }
 
                         change_watcher.abort();
-                        let _ = change_watcher.await;
+                        let _unused = change_watcher.await;
                     }
 
                     is_healthy.store(false, Ordering::SeqCst);
@@ -411,7 +440,7 @@ impl AdsClient {
     /// management server does not support delta xDS we return the client as an error
     #[allow(clippy::type_complexity)]
     pub async fn delta_subscribe<C: crate::config::Configuration>(
-        self,
+        mut self,
         config: Arc<C>,
         is_healthy: Arc<AtomicBool>,
         notifier: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -436,35 +465,28 @@ impl AdsClient {
             stream: &mut tonic::Streaming<DeltaDiscoveryResponse>,
             resources: &'static [(&'static str, &'static [(&'static str, Vec<String>)])],
         ) -> eyre::Result<&'static [(&'static str, Vec<String>)]> {
-            let resource_subscriptions = if let Some(first) = stream.message().await? {
-                let mut rsubs = None;
-                if first.type_url == "ignore-me" {
-                    if !first.system_version_info.is_empty() {
-                        rsubs = resources.iter().find_map(|(vers, subs)| {
-                            (*vers == first.system_version_info).then_some(subs)
-                        });
+            match stream.message().await? {
+                Some(first) => {
+                    if first.type_url != "ignore-me" {
+                        tracing::warn!("expected `ignore-me` response from management server");
                     }
-                } else {
-                    tracing::warn!("expected `ignore-me` response from management server");
-                }
 
-                if let Some(subs) = rsubs {
-                    subs
-                } else {
-                    let Some(subs) = resources
+                    resources
                         .iter()
-                        .find_map(|(vers, subs)| vers.is_empty().then_some(subs))
-                    else {
-                        eyre::bail!("failed to find fallback resource subscription set");
-                    };
-
-                    subs
+                        .find_map(|(vers, subs)| {
+                            (*vers == first.system_version_info).then_some(*subs)
+                        })
+                        .with_context(|| {
+                            format!(
+                                "failed to find resources with version `{}` to subscribe to",
+                                first.system_version_info
+                            )
+                        })
                 }
-            } else {
-                eyre::bail!("expected at least one response from the management server");
-            };
-
-            Ok(resource_subscriptions)
+                _ => {
+                    eyre::bail!("expected at least one response from the management server");
+                }
+            }
         }
 
         let resource_subscriptions = match handle_first_response(&mut stream, resources).await {
@@ -522,7 +544,14 @@ impl AdsClient {
                                 continue;
                             }
                             Ok(Some(Err(error))) => {
-                                tracing::warn!(%error, "xds stream error");
+                                if crate::is_broken_pipe(&error) {
+                                    tracing::info!(
+                                        "remote {} terminated the connection",
+                                        self.connected_endpoint.uri(),
+                                    );
+                                } else {
+                                    tracing::warn!(%error, "xds stream error");
+                                }
                                 break;
                             }
                             Ok(None) => {
@@ -541,14 +570,22 @@ impl AdsClient {
 
                     is_healthy.store(false, Ordering::SeqCst);
 
+                    // Assume a new server we might connect to has completely different
+                    // state from the previous one, so get rid of our current state
+                    // and get a full refresh from the new relay, as well as
+                    // getting rid of any state the previously connected server gave us
+                    local.clear(&config, None);
+
                     tracing::info!("Lost connection to xDS, retrying");
-                    let (new_client, _) =
+                    let (new_client, new_endpoint) =
                         Self::connect_with_backoff(&self.management_servers).await?;
 
                     (ds, stream) =
                         DeltaClientStream::connect(new_client, identifier.clone()).await?;
 
                     resource_subscriptions = handle_first_response(&mut stream, resources).await?;
+
+                    self.connected_endpoint = new_endpoint;
 
                     ds.refresh(&identifier, resource_subscriptions.to_vec(), &local)
                         .await?;

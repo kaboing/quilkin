@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{proto, Prefix, Regex, Suffix, CAPTURED_BYTES};
+use super::{CAPTURED_BYTES, Prefix, Regex, Suffix, proto};
 use crate::filters::ConvertProtoConfigError;
 
 /// Strategy to apply for acquiring a set of bytes in the UDP packet
@@ -72,6 +72,15 @@ pub struct Config {
     pub strategy: Strategy,
 }
 
+impl Config {
+    pub fn with_strategy(strategy: impl Into<Strategy>) -> Self {
+        Self {
+            metadata_key: crate::net::endpoint::metadata::Key::from_static(CAPTURED_BYTES),
+            strategy: strategy.into(),
+        }
+    }
+}
+
 impl Serialize for Config {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -111,7 +120,7 @@ impl<'de> serde::Deserialize<'de> for Config {
         impl<'de> serde::de::Visitor<'de> for ConfigVisitor {
             type Value = Config;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("Capture config")
             }
 

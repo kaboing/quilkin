@@ -21,32 +21,55 @@ pub fn max_grpc_message_size() -> usize {
         .unwrap_or(256 * 1024 * 1024)
 }
 
+pub type VersionMap = HashMap<String, String>;
+pub type TypeUrl = &'static str;
+
 /// Keeps tracking of the local versions of each resource sent from the management
 /// server, allowing reconnections to the same/new management servers to send initial
 /// versions to reduce the initial response size
 pub struct LocalVersions {
-    versions: Vec<(&'static str, parking_lot::Mutex<HashMap<String, String>>)>,
+    versions: Vec<(TypeUrl, parking_lot::Mutex<VersionMap>)>,
 }
 
 impl LocalVersions {
     #[inline]
-    pub fn new(types: impl Iterator<Item = &'static str>) -> Self {
+    pub fn new(types: impl Iterator<Item = TypeUrl>) -> Self {
         Self {
             versions: types.map(|ty| (ty, Default::default())).collect(),
         }
     }
 
     #[inline]
-    pub fn get(&self, ty: &str) -> parking_lot::MutexGuard<'_, HashMap<String, String>> {
-        self.versions
+    pub fn get(&self, ty: &str) -> parking_lot::MutexGuard<'_, VersionMap> {
+        let g = self
+            .versions
             .iter()
-            .find_map(|(t, hm)| (*t == ty).then_some(hm))
-            .unwrap()
-            .lock()
+            .find_map(|(t, hm)| (*t == ty).then_some(hm));
+
+        if let Some(ml) = g {
+            ml.lock()
+        } else {
+            let versions = self.versions.iter().map(|(ty, _)| *ty).collect::<Vec<_>>();
+            panic!("unable to retrieve `{ty}` versions, available versions are {versions:?}");
+        }
+    }
+
+    #[inline]
+    pub fn clear<C: crate::config::Configuration>(
+        &self,
+        config: &Arc<C>,
+        remote_addr: Option<std::net::IpAddr>,
+    ) {
+        for (type_url, map) in &self.versions {
+            let mut map = map.lock();
+            let remove = map.keys().cloned().collect::<Vec<_>>();
+            if let Err(error) = config.apply_delta(type_url, vec![], &remove, remote_addr) {
+                tracing::warn!(%error, count = remove.len(), type_url, "failed to remove resources upon connection loss");
+            }
+            map.clear();
+        }
     }
 }
-
-pub type VersionMap = HashMap<String, String>;
 
 pub struct ClientState {
     pub resource_type: String,
@@ -64,7 +87,7 @@ impl ClientState {
     }
 
     pub fn reset(&mut self, versions: VersionMap) {
-        let _ = std::mem::replace(&mut self.versions, versions);
+        drop(std::mem::replace(&mut self.versions, versions));
         self.subscribed.clear();
     }
 
@@ -175,12 +198,16 @@ impl ClientTracker {
 pub trait Configuration: Send + Sync + Sized + 'static {
     fn identifier(&self) -> String;
 
+    /// Returns whether the current instance is considered the leader of a set
+    /// of replicas, if leader election is enabled in a config provider.
+    fn is_leader(&self) -> Option<bool>;
+
     fn apply_delta(
         &self,
         resource_type: &str,
         resources: Vec<Resource>,
         removed_resources: &[String],
-        remote_addr: Option<std::net::SocketAddr>,
+        remote_addr: Option<std::net::IpAddr>,
     ) -> crate::Result<()>;
 
     fn allow_request_processing(&self, resource_type: &str) -> bool;
@@ -213,9 +240,9 @@ pub fn handle_delta_discovery_responses<C: Configuration>(
     stream: impl futures::Stream<Item = tonic::Result<DeltaDiscoveryResponse>> + 'static + Send,
     config: Arc<C>,
     local: Arc<LocalVersions>,
-    remote_addr: Option<std::net::SocketAddr>,
+    remote_addr: Option<std::net::IpAddr>,
     mut notifier: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-) -> std::pin::Pin<Box<dyn futures::Stream<Item = crate::Result<DeltaDiscoveryRequest>> + Send>> {
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = tonic::Result<DeltaDiscoveryRequest>> + Send>> {
     Box::pin(async_stream::try_stream! {
         let _stream_metrics = crate::metrics::StreamConnectionMetrics::new(identifier.clone());
         tracing::trace!("awaiting delta response");
@@ -224,7 +251,7 @@ pub fn handle_delta_discovery_responses<C: Configuration>(
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    tracing::warn!(%error, "Error from xDS server");
+                    yield Err(error)?;
                     break;
                 }
             };
